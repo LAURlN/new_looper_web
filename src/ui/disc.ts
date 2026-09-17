@@ -21,29 +21,43 @@ const GEAR_ICON = `
     <circle cx="12" cy="12" r="3.1" />
   </svg>`;
 
+function loopText(snapshot: EngineSnapshot): string {
+  return snapshot.loopSeconds === null ? 'no loop yet' : `${snapshot.loopSeconds.toFixed(1)} s loop`;
+}
+
 function labelFor(snapshot: EngineSnapshot): { label: string; sub: string; cls: string } {
   const { state, layerCount, overdubIndex, maxLayers } = snapshot;
+  const layers = `${layerCount} layer${layerCount === 1 ? '' : 's'}`;
   switch (state) {
     case 'RECORDING':
-      return { label: 'Recording… tap to stop', sub: 'base take', cls: 'is-recording' };
+      return { label: 'Recording… tap to stop', sub: 'this take becomes the loop', cls: 'is-recording' };
     case 'OVERDUBBING':
+      if (snapshot.waitingForLoopPoint) {
+        return {
+          label: `Overdub ${overdubIndex}/4`,
+          sub: 'waiting for the loop point — tap to cancel',
+          cls: 'is-overdubbing',
+        };
+      }
       return {
         label: `Overdub ${overdubIndex}/4… tap to stop`,
-        sub: `${layerCount} layer${layerCount === 1 ? '' : 's'} playing with you`,
+        sub: `${layers} playing with you`,
         cls: 'is-overdubbing',
       };
     case 'FULL':
       return {
         label: `${maxLayers - 1}/4 overdubs — undo to continue`,
-        sub: `${layerCount} layers, no room left`,
+        sub: `looping ${layers} · ${loopText(snapshot)}`,
         cls: 'is-full',
       };
     case 'IDLE':
     default:
-      if (layerCount === 0) return { label: 'Tap to record', sub: 'nothing recorded yet', cls: 'is-idle' };
+      if (layerCount === 0) {
+        return { label: 'Tap to record', sub: 'the first take becomes the loop', cls: 'is-idle' };
+      }
       return {
-        label: 'Tap to overdub',
-        sub: `${layerCount} layer${layerCount === 1 ? '' : 's'} · next is overdub ${layerCount}/4`,
+        label: 'Looping — tap to overdub',
+        sub: `${layers} · ${loopText(snapshot)} · overdub ${layerCount}/4`,
         cls: 'is-idle',
       };
   }
