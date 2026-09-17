@@ -23,6 +23,12 @@ const sheet = createSettingsSheet(document.body, {
   onRetryMicrophone: () => {
     void engine.retryMicrophone().then(() => sheet.refresh());
   },
+  onTestTone: () => {
+    void engine.ensureReady().then((problem) => {
+      if (problem === null) engine.playTestTone();
+      else sheet.setStatus(problem);
+    });
+  },
 });
 
 const disc = createDiscView(app, {
@@ -94,6 +100,7 @@ window.addEventListener(
 // A take cannot survive the app being backgrounded (the context is suspended anyway).
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') void engine.handleBackgrounded();
+  else engine.handleForegrounded();
 });
 
 window.addEventListener('pagehide', () => {

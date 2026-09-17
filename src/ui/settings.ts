@@ -11,6 +11,7 @@ export interface SettingsSheetOptions {
   onCalibrate(): void;
   onClearCalibration(): void;
   onRetryMicrophone(): void;
+  onTestTone(): void;
 }
 
 export interface SettingsSheet {
@@ -84,6 +85,14 @@ export function createSettingsSheet(
         calibrate.addEventListener('click', () => options.onCalibrate());
         panel.append(calibrate);
 
+        const tone = document.createElement('button');
+        tone.type = 'button';
+        tone.className = 'btn btn-block';
+        tone.style.marginTop = '10px';
+        tone.textContent = 'Play test tone';
+        tone.addEventListener('click', () => options.onTestTone());
+        panel.append(tone);
+
         if (info.calibration) {
           const when = info.calibration.measuredAt
             ? new Date(info.calibration.measuredAt).toLocaleString()
@@ -113,6 +122,23 @@ export function createSettingsSheet(
         ].join(' · ');
         diagnostic.textContent = `Browser-reported (not the measured round trip): ${reported}.`;
         panel.append(diagnostic);
+
+        if (info.lastTake) {
+          const silent = info.lastTake.peak < 0.01;
+          const lastTake = document.createElement('p');
+          lastTake.className = `diagnostic${silent ? ' diagnostic-error' : ''}`;
+          lastTake.style.marginTop = '10px';
+          lastTake.textContent = silent
+            ? `Last take: ${info.lastTake.seconds.toFixed(1)} s, silent (peak ${info.lastTake.peak.toFixed(3)}) — the mic captured nothing.`
+            : `Last take: ${info.lastTake.seconds.toFixed(1)} s, peak ${info.lastTake.peak.toFixed(2)}.`;
+          panel.append(lastTake);
+        }
+
+        const build = document.createElement('p');
+        build.className = 'diagnostic';
+        build.style.marginTop = '16px';
+        build.textContent = `Build ${__BUILD_STAMP__}.`;
+        panel.append(build);
 
         const status = document.createElement('p');
         status.className = 'status';

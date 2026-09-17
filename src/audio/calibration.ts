@@ -233,7 +233,8 @@ export async function calibrate(io: CalibrationIO): Promise<CalibrationResult> {
     const probe = probes[index];
     onStatus?.(`Playing test sound ${index + 1} of ${probes.length}…`);
     const buffer = ctx.createBuffer(1, probe.samples.length, sampleRate);
-    buffer.copyToChannel(probe.samples, 0);
+    // getChannelData().set() is the most widely supported way to fill a buffer.
+    buffer.getChannelData(0).set(probe.samples);
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     source.connect(output);

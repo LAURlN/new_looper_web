@@ -32,13 +32,6 @@ function labelFor(snapshot: EngineSnapshot): { label: string; sub: string; cls: 
     case 'RECORDING':
       return { label: 'Recording… tap to stop', sub: 'this take becomes the loop', cls: 'is-recording' };
     case 'OVERDUBBING':
-      if (snapshot.waitingForLoopPoint) {
-        return {
-          label: `Overdub ${overdubIndex}/4`,
-          sub: 'waiting for the loop point — tap to cancel',
-          cls: 'is-overdubbing',
-        };
-      }
       return {
         label: `Overdub ${overdubIndex}/4… tap to stop`,
         sub: `${layers} playing with you`,

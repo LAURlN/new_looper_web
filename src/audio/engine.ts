@@ -14,8 +14,8 @@ import {
   type CalibrationRecord,
   type CalibrationResult,
 } from './calibration';
-import { MicError, MicRecorder, openMicrophone, type MicTake } from './mic';
-import type { MonoBuffer } from './dsp';
+import { MicError, MicRecorder, openMicrophone } from './mic';
+import { peakAmplitude, type MonoBuffer } from './dsp';
 
 export type EngineStateName = 'IDLE' | 'RECORDING' | 'OVERDUBBING' | 'FULL';
 export type MicState = 'unknown' | 'ready' | 'denied' | 'unavailable' | 'unsupported' | 'error';
@@ -25,24 +25,26 @@ export const MAX_OVERDUBS = MAX_LAYERS - 1;
 
 /** Takes shorter than this are treated as accidental double taps and discarded. */
 const MIN_TAKE_SECONDS = 0.05;
-/** Silence between the last take and the first loop cycle, so the loop starts cleanly. */
-const LOOP_START_LEAD_SECONDS = 0.1;
-/** How far ahead cycles are scheduled on the audio clock. */
-const SCHEDULE_LOOKAHEAD_SECONDS = 1.5;
+/** How far ahead cycles are scheduled on the audio clock. Generous, so a stalled timer
+ *  (throttled background tab, GC pause) cannot punch a hole in the loop. */
+const SCHEDULE_LOOKAHEAD_SECONDS = 6;
 /** How often the scheduler wakes up to top up the lookahead window. */
 const SCHEDULER_INTERVAL_MS = 250;
 /** A cycle boundary closer than this is skipped rather than scheduled late. */
 const MIN_CYCLE_LEAD_SECONDS = 0.02;
-/** Overdubs start at the first loop point at least this far in the future. */
-const OVERDUB_QUANTIZE_LEAD_SECONDS = 0.05;
+/** A take this quiet is treated as "the microphone heard nothing". */
+const SILENT_TAKE_PEAK = 0.01;
 
 export interface Layer {
   id: number;
-  /** Mono, ctx.sampleRate. */
+  /** Mono, ctx.sampleRate, exactly one loop cycle long so playback needs no offsets. */
   samples: MonoBuffer;
-  /** AudioContext frame when the take began. */
+  /** AudioContext frame of the layer's musical position 0 (the loop anchor). */
   originFrame: number;
-  /** Latency compensation, usually negative. */
+  /**
+   * Latency compensation that was baked in when the take was folded into the cycle.
+   * Playback needs no further shift — this is kept for diagnostics only.
+   */
   shiftFrames: number;
 }
 
@@ -54,8 +56,6 @@ export interface EngineSnapshot {
   overdubIndex: number;
   /** Length of one loop cycle in seconds, or null before the first take exists. */
   loopSeconds: number | null;
-  /** True while an overdub is armed but has not reached the loop point yet. */
-  waitingForLoopPoint: boolean;
   canUndo: boolean;
   calibrated: boolean;
   calibratedMs: number | null;
@@ -74,6 +74,8 @@ export interface AudioInfo {
   calibratedMs: number | null;
   micState: MicState;
   micMessage: string | null;
+  /** What the most recent take contained — the quickest way to spot a dead microphone. */
+  lastTake: { seconds: number; peak: number } | null;
 }
 
 /** `null` when the audio context + microphone are usable, otherwise a user-facing reason. */
@@ -104,7 +106,7 @@ export class LoopEngine {
   private loopAnchorFrame = 0;
   private nextCycleFrame = 0;
   private schedulerTimer: number | null = null;
-  private waitingForLoopPoint = false;
+  private lastTake: { seconds: number; peak: number } | null = null;
   private calibration: CalibrationRecord | null = null;
   private nextLayerId = 1;
   private transitioning = false;
@@ -114,7 +116,6 @@ export class LoopEngine {
   private smoothedLevel = 0;
   private levelRaf = 0;
   private analyserBuffer: MonoBuffer | null = null;
-  private passOriginFrame = 0;
 
   constructor() {
     this.state = new Observable<EngineSnapshot>({
@@ -123,7 +124,6 @@ export class LoopEngine {
       maxLayers: MAX_LAYERS,
       overdubIndex: 0,
       loopSeconds: null,
-      waitingForLoopPoint: false,
       canUndo: false,
       calibrated: false,
       calibratedMs: null,
@@ -337,7 +337,32 @@ export class LoopEngine {
       calibratedMs: usable && this.calibration ? this.calibration.roundTripMs : null,
       micState: snapshot.micState,
       micMessage: snapshot.message,
+      lastTake: this.lastTake,
     };
+  }
+
+  /** Plays a short tone through the monitoring bus, to prove the output path works. */
+  playTestTone(): void {
+    const ctx = this.requireCtx();
+    const master = this.requireMaster();
+    const oscillator = ctx.createOscillator();
+    const gain = ctx.createGain();
+    oscillator.frequency.value = 440;
+    oscillator.connect(gain);
+    gain.connect(master);
+    const start = ctx.currentTime + 0.05;
+    gain.gain.setValueAtTime(0, start);
+    gain.gain.linearRampToValueAtTime(0.3, start + 0.02);
+    gain.gain.setValueAtTime(0.3, start + 0.7);
+    gain.gain.linearRampToValueAtTime(0, start + 0.9);
+    oscillator.start(start);
+    oscillator.stop(start + 0.95);
+  }
+
+  /** Re-books the loop after the app comes back to the foreground. */
+  handleForegrounded(): void {
+    if (this.layers.length === 0 || this.loopLengthFrames <= 0) return;
+    this.rescheduleLoop();
   }
 
   /** Re-attempts the microphone after the user grants permission in browser settings. */
@@ -364,9 +389,8 @@ export class LoopEngine {
   private async beginFirstTake(): Promise<void> {
     const ctx = this.requireCtx();
     const recorder = this.requireRecorder();
-    const originFrame = await recorder.arm();
-    // The base take defines the timeline, so its own origin is the reference: shift 0.
-    this.passOriginFrame = originFrame;
+    // Recording starts the moment the finger lands. No count-in, no quantised wait.
+    await recorder.arm();
     this.setState('RECORDING', { overdubIndex: 0, message: null });
     void this.requestWakeLock();
     if (ctx.state !== 'running') await ctx.resume();
@@ -380,8 +404,8 @@ export class LoopEngine {
       this.patch({ message: 'Take too short — nothing recorded' });
       return;
     }
-    // The first take *is* the loop: its length defines the cycle, and because it was
-    // recorded as the only layer there is nothing to align it against, so shift 0.
+    // The first take *is* the loop: it defines the cycle length and, since its own start
+    // is musical position 0, the phase anchor every later layer is measured against.
     this.layers.push({
       id: this.nextLayerId++,
       samples: take.samples,
@@ -391,20 +415,17 @@ export class LoopEngine {
     this.loopLengthFrames = take.samples.length;
     this.startLoop();
     this.setState(this.layers.length >= MAX_LAYERS ? 'FULL' : 'IDLE', { message: null });
+    this.noteTake(take.samples);
   }
 
   private async beginOverdubPass(): Promise<void> {
     const recorder = this.requireRecorder();
-    // The loop is already running, so the overdub has to enter at a loop point, not
-    // wherever the finger landed. Everything before that is pre-roll and is trimmed away
-    // when the take is committed.
-    const passOriginFrame = this.nextCycleBoundaryFrame(OVERDUB_QUANTIZE_LEAD_SECONDS);
+    // The loop is already running. Recording starts on the tap and runs until the next
+    // tap — its musical phase is worked out from absolute frames when it is folded in,
+    // so there is nothing to wait for.
     await recorder.arm();
-    this.passOriginFrame = passOriginFrame;
-    this.waitingForLoopPoint = Math.round(this.requireCtx().currentTime * this.requireCtx().sampleRate) < passOriginFrame;
     this.setState('OVERDUBBING', {
       overdubIndex: this.layers.length,
-      waitingForLoopPoint: this.waitingForLoopPoint,
       message: null,
     });
     void this.requestWakeLock();
@@ -413,47 +434,57 @@ export class LoopEngine {
   private async commitOverdub(): Promise<void> {
     const take = await this.requireRecorder().disarm();
     this.releaseWakeLock();
-    this.waitingForLoopPoint = false;
-    // Everything captured before the loop point belongs to the previous cycle.
-    const aligned = this.trimToPassOrigin(take);
-    if (!this.isTakeUsable(aligned.samples.length)) {
+    if (!this.isTakeUsable(take.samples.length)) {
       this.abortPass();
       this.patch({ message: 'Take too short — nothing recorded' });
       return;
     }
 
-    // Sample 0 is now the loop point, so the whole compensation is the round trip.
     // The performer plays in time with the monitor, which they hear delayed by output
     // latency, and their performance is captured delayed again by input latency. The
-    // measured round trip is exactly output + input, so pulling the new layer earlier by
-    // that much lines it up with the loop as the performer heard it.
-    let shiftFrames = -this.latencyFrames();
-    if (shiftFrames < -aligned.samples.length) {
-      console.warn(
-        `[loop-recorder] latency shift (${shiftFrames} frames) exceeds take length (${aligned.samples.length}); clamping`,
-      );
-      shiftFrames = -aligned.samples.length;
-    }
+    // measured round trip is exactly output + input, so the take has to be pulled back by
+    // that much — plus however far into the cycle the tap happened — to land on the beat
+    // the performer was playing along with.
+    const shiftFrames = take.originFrame - this.loopAnchorFrame - this.latencyFrames();
+    const folded = this.foldIntoCicle(take.samples, shiftFrames);
     this.layers.push({
       id: this.nextLayerId++,
-      samples: aligned.samples,
-      originFrame: aligned.originFrame,
+      samples: folded,
+      originFrame: this.loopAnchorFrame,
       shiftFrames,
     });
-    // Cycles already scheduled do not know about the new layer; rebuild the ones that
-    // have not sounded yet so the layer joins at the very next loop point.
+    // Cycles already booked do not know about the new layer; rebuild the ones that have
+    // not sounded yet so the layer joins at the very next loop point.
     this.rescheduleLoop();
     this.setState(this.layers.length >= MAX_LAYERS ? 'FULL' : 'IDLE', { message: null });
+    this.noteTake(take.samples);
   }
 
   /**
-   * Drops the pre-roll captured before the loop point, so sample 0 of the take lines up
-   * with musical position 0 of the cycle.
+   * Folds a take into one loop cycle. Sample i belongs at musical position i + shift, and
+   * anything that lands past the loop point wraps around to the start of the cycle and
+   * sums with what is already there — so an overdub longer than the loop keeps playing
+   * round and round instead of being cut off.
    */
-  private trimToPassOrigin(take: MicTake): MicTake {
-    const cut = Math.max(0, Math.min(take.samples.length, this.passOriginFrame - take.originFrame));
-    if (cut === 0) return take;
-    return { samples: take.samples.slice(cut), originFrame: take.originFrame + cut };
+  private foldIntoCicle(samples: MonoBuffer, shiftFrames: number): MonoBuffer {
+    const loopFrames = this.loopLengthFrames;
+    const folded = new Float32Array(loopFrames);
+    if (loopFrames <= 0) return folded;
+    for (let i = 0; i < samples.length; i++) {
+      let position = (i + shiftFrames) % loopFrames;
+      if (position < 0) position += loopFrames;
+      folded[position] += samples[i];
+    }
+    return folded;
+  }
+
+  /** Records what the last take actually contained, for the diagnostics panel. */
+  private noteTake(samples: MonoBuffer): void {
+    const peak = peakAmplitude(samples);
+    this.lastTake = { seconds: samples.length / this.requireCtx().sampleRate, peak };
+    if (peak < SILENT_TAKE_PEAK) {
+      this.patch({ message: 'Recorded silence — check the microphone input' });
+    }
   }
 
   private async discardInFlightTake(message: string): Promise<void> {
@@ -472,10 +503,9 @@ export class LoopEngine {
 
   private abortPass(): void {
     // The loop keeps running: cancelling an overdub should not take the backing loop away.
-    this.waitingForLoopPoint = false;
     this.releaseWakeLock();
     const current = this.state.get().state;
-    this.setState(current === 'FULL' ? 'FULL' : 'IDLE', { overdubIndex: 0, waitingForLoopPoint: false });
+    this.setState(current === 'FULL' ? 'FULL' : 'IDLE', { overdubIndex: 0 });
   }
 
   private isTakeUsable(frameCount: number): boolean {
@@ -498,8 +528,9 @@ export class LoopEngine {
    * drifts and no source can bleed into the next cycle.
    */
   private startLoop(): void {
-    const ctx = this.requireCtx();
-    this.loopAnchorFrame = Math.round((ctx.currentTime + LOOP_START_LEAD_SECONDS) * ctx.sampleRate);
+    // Phase anchor: musical position 0 is the first take's capture origin. It is in the
+    // past on purpose — the scheduler simply books the first cycle that is still ahead.
+    this.loopAnchorFrame = this.layers[0]?.originFrame ?? Math.round(this.requireCtx().currentTime * this.requireCtx().sampleRate);
     this.nextCycleFrame = this.loopAnchorFrame;
     this.scheduleHorizon();
     if (this.schedulerTimer === null) {
@@ -522,7 +553,14 @@ export class LoopEngine {
 
   private scheduleHorizon(): void {
     const ctx = this.ctx;
-    if (!ctx || this.loopLengthFrames <= 0 || this.layers.length === 0) return;
+    if (!ctx || this.layers.length === 0) return;
+    // Safety net: if the loop bookkeeping was ever lost, rebuild it from the layers so
+    // playback can never be silently left off.
+    if (this.loopLengthFrames <= 0) {
+      this.loopLengthFrames = this.layers[0].samples.length;
+      this.loopAnchorFrame = this.layers[0].originFrame;
+      this.nextCycleFrame = this.loopAnchorFrame;
+    }
     const sampleRate = ctx.sampleRate;
     const horizon = Math.round((ctx.currentTime + SCHEDULE_LOOKAHEAD_SECONDS) * sampleRate);
     const minLead = Math.round((ctx.currentTime + MIN_CYCLE_LEAD_SECONDS) * sampleRate);
@@ -540,25 +578,21 @@ export class LoopEngine {
     const ctx = this.requireCtx();
     const master = this.requireMaster();
     const sampleRate = ctx.sampleRate;
-    const loopFrames = this.loopLengthFrames;
 
     for (const layer of this.layers) {
-      const takeFrames = layer.samples.length;
-      // Musical position j inside the cycle maps to take sample index j - shiftFrames.
-      // A negative shift (the usual case) therefore skips the take's head, which is
-      // capture that belongs *before* the loop point. A positive shift pads silence.
-      const startIndex = Math.max(0, -layer.shiftFrames);
-      const startDelay = Math.max(0, layer.shiftFrames);
-      const frames = Math.min(takeFrames - startIndex, loopFrames - startDelay);
-      if (frames <= 0) continue;
-
-      const source = ctx.createBufferSource();
-      source.buffer = this.bufferFor(layer);
-      source.connect(master);
-      // `duration` confines this segment to its own cycle: anything past the loop point
-      // belongs to the next cycle, which schedules itself.
-      source.start((cycleFrame + startDelay) / sampleRate, startIndex / sampleRate, frames / sampleRate);
-      this.scheduled.push({ node: source, startFrame: cycleFrame + startDelay });
+      if (layer.samples.length === 0) continue;
+      try {
+        const source = ctx.createBufferSource();
+        source.buffer = this.bufferFor(layer);
+        source.connect(master);
+        // Every layer is exactly one cycle long, so a plain start at the cycle boundary is
+        // the whole story: no offset, no duration, nothing that can drift or be dropped.
+        source.start(cycleFrame / sampleRate);
+        this.scheduled.push({ node: source, startFrame: cycleFrame });
+      } catch (error) {
+        console.error('[loop-recorder] could not schedule a loop cycle', error);
+        this.patch({ message: 'Playback error — see the browser console' });
+      }
     }
   }
 
@@ -567,18 +601,11 @@ export class LoopEngine {
     if (cached) return cached;
     const ctx = this.requireCtx();
     const buffer = ctx.createBuffer(1, Math.max(1, layer.samples.length), ctx.sampleRate);
-    buffer.copyToChannel(layer.samples, 0);
+    // getChannelData().set() rather than copyToChannel(): the same result, but supported
+    // by every browser that has AudioBufferSourceNode at all.
+    buffer.getChannelData(0).set(layer.samples);
     this.bufferCache.set(layer, buffer);
     return buffer;
-  }
-
-  /** Frame of the first cycle boundary at least `leadSeconds` in the future. */
-  private nextCycleBoundaryFrame(leadSeconds: number): number {
-    const ctx = this.requireCtx();
-    const earliest = Math.round((ctx.currentTime + leadSeconds) * ctx.sampleRate);
-    if (this.loopLengthFrames <= 0) return earliest;
-    const cycles = Math.ceil((earliest - this.loopAnchorFrame) / this.loopLengthFrames);
-    return this.loopAnchorFrame + cycles * this.loopLengthFrames;
   }
 
   /** Drops segments that have not started yet so future cycles can be rebuilt. */
@@ -652,12 +679,6 @@ export class LoopEngine {
       this.smoothedLevel = target > this.smoothedLevel ? target : this.smoothedLevel * 0.9;
       this.level.set(Math.min(1, this.smoothedLevel * 1.8));
 
-      // Tell the UI when the quantised overdub actually lands on the loop point.
-      const ctx = this.ctx;
-      if (this.waitingForLoopPoint && ctx && Math.round(ctx.currentTime * ctx.sampleRate) >= this.passOriginFrame) {
-        this.waitingForLoopPoint = false;
-        this.patch({ waitingForLoopPoint: false });
-      }
     };
     this.levelRaf = requestAnimationFrame(tick);
   }
