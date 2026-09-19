@@ -12,11 +12,16 @@ export interface SettingsSheetOptions {
   onClearCalibration(): void;
   onRetryMicrophone(): void;
   onTestTone(): void;
+  /** Additional tabs (e.g. Session) composed by main.ts. */
+  extraTabs?: SheetTab[];
 }
 
 export interface SettingsSheet {
   open(): void;
   close(): void;
+  /** Open the sheet with a specific tab selected. */
+  openTab(id: string): void;
+  isOpen(): boolean;
   refresh(): void;
   setStatus(text: string | null): void;
 }
@@ -163,10 +168,12 @@ export function createSettingsSheet(
         }
       },
     },
+    ...(options.extraTabs ?? []),
   ];
 
   let activeTabId = tabs[0]?.id ?? '';
   let currentStatus: string | null = null;
+  let openState = false;
   const tabButtons = new Map<string, HTMLButtonElement>();
 
   const renderPanel = (): void => {
@@ -202,12 +209,14 @@ export function createSettingsSheet(
     renderPanel();
     scrim.classList.add('is-open');
     sheet.classList.add('is-open');
+    openState = true;
   };
 
   const close = (): void => {
     scrim.classList.remove('is-open');
     sheet.classList.remove('is-open');
     sheet.style.transform = '';
+    openState = false;
   };
 
   scrim.addEventListener('click', close);
@@ -245,6 +254,11 @@ export function createSettingsSheet(
   return {
     open,
     close,
+    openTab(id) {
+      selectTab(id);
+      open();
+    },
+    isOpen: () => openState,
     refresh: renderPanel,
     setStatus(text) {
       currentStatus = text;

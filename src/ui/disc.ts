@@ -1,14 +1,17 @@
 import type { EngineSnapshot } from '../audio/engine';
+import type { CollabSnapshot } from '../collab/types';
 
 export interface DiscHandlers {
   onTap(): void;
   onUndo(): void;
   onOpenSettings(): void;
+  onOpenSession(): void;
 }
 
 export interface DiscView {
   setSnapshot(snapshot: EngineSnapshot): void;
   setLevel(level: number): void;
+  setSession(snapshot: CollabSnapshot): void;
 }
 
 const GEAR_ICON = `
@@ -71,7 +74,14 @@ export function createDiscView(root: HTMLElement, handlers: DiscHandlers): DiscV
   gear.innerHTML = GEAR_ICON;
   gear.addEventListener('click', () => handlers.onOpenSettings());
 
-  topbar.append(title, gear);
+  // Presence pill: hidden until a session is joined, then shows who is here.
+  const sessionPill = document.createElement('button');
+  sessionPill.type = 'button';
+  sessionPill.className = 'pill';
+  sessionPill.hidden = true;
+  sessionPill.addEventListener('click', () => handlers.onOpenSession());
+
+  topbar.append(title, sessionPill, gear);
 
   const banner = document.createElement('div');
   banner.className = 'banner';
@@ -162,6 +172,22 @@ export function createDiscView(root: HTMLElement, handlers: DiscHandlers): DiscV
     },
     setLevel(level) {
       disc.style.setProperty('--level', level.toFixed(3));
+    },
+    setSession(snapshot) {
+      if (!snapshot.active) {
+        sessionPill.hidden = true;
+        return;
+      }
+      const total = snapshot.peers.length + 1;
+      sessionPill.hidden = false;
+      sessionPill.textContent = snapshot.connection === 'live' ? `\u25cf ${total}` : '\u25cc';
+      sessionPill.classList.toggle('is-live', snapshot.connection === 'live');
+      const parts: string[] = [
+        total === 1 ? 'Live session — waiting for others' : `${total} in this session`,
+      ];
+      if (snapshot.pendingClips > 0) parts.push(`fetching ${snapshot.pendingClips} clip(s)`);
+      if (snapshot.status) parts.push(snapshot.status);
+      sessionPill.title = parts.join(' · ');
     },
   };
 }

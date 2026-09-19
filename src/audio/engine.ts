@@ -16,6 +16,7 @@ import {
 } from './calibration';
 import { MicError, MicRecorder, openMicrophone } from './mic';
 import { peakAmplitude, type MonoBuffer } from './dsp';
+import type { CommittedClip } from '../collab/types';
 
 export type EngineStateName = 'IDLE' | 'RECORDING' | 'OVERDUBBING' | 'FULL';
 export type MicState = 'unknown' | 'ready' | 'denied' | 'unavailable' | 'unsupported' | 'error';
@@ -35,8 +36,23 @@ const MIN_CYCLE_LEAD_SECONDS = 0.02;
 /** A take this quiet is treated as "the microphone heard nothing". */
 const SILENT_TAKE_PEAK = 0.01;
 
+/** Layer ids replicate across peers, so they must be globally unique strings. */
+function newLayerId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `layer-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export interface Layer {
-  id: number;
+  /**
+   * Globally unique id. It is a string (rather than a local counter) because a
+   * layer can now arrive from another device, so it must be identifiable across
+   * peers — it is also the key a replicated clip is deduplicated by.
+   */
+  id: string;
+  /** Identity id of the device that recorded this layer; 'local' when solo. */
+  authorId: string;
   /** Mono, ctx.sampleRate, exactly one loop cycle long so playback needs no offsets. */
   samples: MonoBuffer;
   /** AudioContext frame of the layer's musical position 0 (the loop anchor). */
@@ -108,7 +124,9 @@ export class LoopEngine {
   private schedulerTimer: number | null = null;
   private lastTake: { seconds: number; peak: number } | null = null;
   private calibration: CalibrationRecord | null = null;
-  private nextLayerId = 1;
+  private localAuthorId = 'local';
+  private commitHook: ((clip: CommittedClip) => void) | null = null;
+  private removeHook: ((clipId: string) => void) | null = null;
   private transitioning = false;
   private fatal: string | null = null;
   private wakeLock: WakeLockSentinelLike | null = null;
@@ -258,8 +276,13 @@ export class LoopEngine {
         await this.discardInFlightTake('Take discarded');
         return;
       }
-      if (this.layers.length > 0) {
-        this.layers.pop();
+      // In a shared project "undo" must never delete someone else's work, so it
+      // removes the last layer *this device* recorded. In solo use every layer is
+      // local, which preserves the original "remove the last layer" behaviour.
+      const index = this.lastLocalLayerIndex();
+      if (index >= 0) {
+        const [removed] = this.layers.splice(index, 1);
+        this.removeHook?.(removed.id);
         if (this.layers.length === 0) {
           this.stopLoop();
         } else {
@@ -365,6 +388,127 @@ export class LoopEngine {
     this.rescheduleLoop();
   }
 
+  // -------------------------------------------------- shared project (collab)
+
+  /** The identity id used to mark layers this device recorded. */
+  setLocalAuthor(id: string): void {
+    this.localAuthorId = id;
+  }
+
+  /** Called after a local take is committed, with its folded, publishable form. */
+  onClipCommitted(hook: ((clip: CommittedClip) => void) | null): void {
+    this.commitHook = hook;
+  }
+
+  /** Called when a local layer is removed, so the shared document can tombstone it. */
+  onClipRemoved(hook: ((clipId: string) => void) | null): void {
+    this.removeHook = hook;
+  }
+
+  hasAudioContext(): boolean {
+    return this.ctx !== null;
+  }
+
+  audioContext(): AudioContext {
+    return this.requireCtx();
+  }
+
+  getSampleRate(): number | null {
+    return this.ctx ? this.ctx.sampleRate : null;
+  }
+
+  getLoopLengthFrames(): number {
+    return this.loopLengthFrames;
+  }
+
+  hasLayer(id: string): boolean {
+    return this.layers.some((layer) => layer.id === id);
+  }
+
+  /**
+   * Snapshot of the current layers, used to publish a solo project when it later
+   * becomes a shared session ("I already had a loop, now invite someone").
+   */
+  getLayersForSharing(): Array<{ id: string; authorId: string; samples: MonoBuffer; slot: number }> {
+    return this.layers.map((layer, index) => ({
+      id: layer.id,
+      authorId: layer.authorId,
+      samples: layer.samples,
+      slot: index,
+    }));
+  }
+
+  /**
+   * Adds a clip that arrived from another peer.
+   *
+   * This is where "playback is never synchronised" pays off: the clip is already
+   * exactly one loop cycle, so it is simply dropped into `layers` and the
+   * existing scheduler plays it at the next cycle boundary on *this* device's
+   * clock. No offsets, no clock comparison, no re-folding, no latency baking.
+   */
+  addRemoteLayer(clip: { id: string; authorId: string; samples: MonoBuffer }): void {
+    if (this.hasLayer(clip.id)) return;
+    const ctx = this.requireCtx();
+    if (this.loopLengthFrames <= 0) {
+      // No local loop yet: this distant clip defines the cycle (the shared
+      // `cycleFrames` value was already agreed by the collaboration layer).
+      this.loopLengthFrames = clip.samples.length;
+      this.loopAnchorFrame = Math.round(ctx.currentTime * ctx.sampleRate);
+      this.nextCycleFrame = this.loopAnchorFrame;
+    }
+    this.layers.push({
+      id: clip.id,
+      authorId: clip.authorId,
+      samples: clip.samples,
+      originFrame: this.loopAnchorFrame,
+      shiftFrames: 0,
+    });
+    if (this.schedulerTimer === null) this.startLoop();
+    else this.rescheduleLoop();
+    this.notifyLayersChanged();
+  }
+
+  /** Removes a replicated layer (used when a tombstone arrives from a peer). */
+  removeLayer(id: string): void {
+    const index = this.layers.findIndex((layer) => layer.id === id);
+    if (index < 0) return;
+    this.layers.splice(index, 1);
+    if (this.layers.length === 0) this.stopLoop();
+    else this.rescheduleLoop();
+    this.notifyLayersChanged();
+  }
+
+  private lastLocalLayerIndex(): number {
+    for (let i = this.layers.length - 1; i >= 0; i--) {
+      if (this.layers[i].authorId === this.localAuthorId) return i;
+    }
+    return -1;
+  }
+
+  private notifyLayersChanged(): void {
+    const current = this.state.get().state;
+    if (current === 'RECORDING' || current === 'OVERDUBBING') {
+      this.setState(current, {});
+      return;
+    }
+    this.setState(this.layers.length >= MAX_LAYERS ? 'FULL' : 'IDLE', { message: null });
+  }
+
+  /** Hands a freshly committed layer to the collaboration layer, if attached. */
+  private publishLayer(layer: Layer, isFirst: boolean): void {
+    const sampleRate = this.ctx?.sampleRate;
+    if (sampleRate === undefined) return;
+    this.commitHook?.({
+      id: layer.id,
+      authorId: layer.authorId,
+      samples: layer.samples,
+      sampleRate,
+      cycleFrames: layer.samples.length,
+      slot: Math.max(0, this.layers.indexOf(layer)),
+      isFirst,
+    });
+  }
+
   /** Re-attempts the microphone after the user grants permission in browser settings. */
   async retryMicrophone(): Promise<void> {
     this.fatal = null;
@@ -407,7 +551,8 @@ export class LoopEngine {
     // The first take *is* the loop: it defines the cycle length and, since its own start
     // is musical position 0, the phase anchor every later layer is measured against.
     this.layers.push({
-      id: this.nextLayerId++,
+      id: newLayerId(),
+      authorId: this.localAuthorId,
       samples: take.samples,
       originFrame: take.originFrame,
       shiftFrames: 0,
@@ -416,6 +561,7 @@ export class LoopEngine {
     this.startLoop();
     this.setState(this.layers.length >= MAX_LAYERS ? 'FULL' : 'IDLE', { message: null });
     this.noteTake(take.samples);
+    this.publishLayer(this.layers[this.layers.length - 1], true);
   }
 
   private async beginOverdubPass(): Promise<void> {
@@ -448,7 +594,8 @@ export class LoopEngine {
     const shiftFrames = take.originFrame - this.loopAnchorFrame - this.latencyFrames();
     const folded = this.foldIntoCicle(take.samples, shiftFrames);
     this.layers.push({
-      id: this.nextLayerId++,
+      id: newLayerId(),
+      authorId: this.localAuthorId,
       samples: folded,
       originFrame: this.loopAnchorFrame,
       shiftFrames,
@@ -458,6 +605,7 @@ export class LoopEngine {
     this.rescheduleLoop();
     this.setState(this.layers.length >= MAX_LAYERS ? 'FULL' : 'IDLE', { message: null });
     this.noteTake(take.samples);
+    this.publishLayer(this.layers[this.layers.length - 1], false);
   }
 
   /**

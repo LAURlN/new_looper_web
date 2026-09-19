@@ -1,6 +1,9 @@
 import './styles.css';
 import { LoopEngine } from './audio/engine';
+import { CollaborationController } from './collab/controller';
+import { generateRoomId, readRoomId } from './collab/room';
 import { createDiscView } from './ui/disc';
+import { createSessionTab } from './ui/session';
 import { createSettingsSheet } from './ui/settings';
 import { showInfoModal, showModal } from './ui/modal';
 
@@ -8,7 +11,27 @@ const app = document.getElementById('app');
 if (!app) throw new Error('#app is missing from index.html');
 
 const engine = new LoopEngine();
+
+// The collaboration controller is always constructed, but it does nothing on the
+// network until a room is joined — solo use is byte-for-byte the old behaviour.
+const collab = new CollaborationController();
+collab.attachEngine(engine);
+
 let calibrating = false;
+
+const sessionTab = createSessionTab({
+  getSnapshot: () => collab.snapshot.get(),
+  getIdentity: () => collab.getIdentity(),
+  onStart: () => {
+    void startSession(generateRoomId());
+  },
+  onLeave: () => {
+    void collab.stop();
+  },
+  onCopyLink: () => {
+    void copyInviteLink();
+  },
+});
 
 const sheet = createSettingsSheet(document.body, {
   getInfo: () => engine.getAudioInfo(),
@@ -29,6 +52,7 @@ const sheet = createSettingsSheet(document.body, {
       else sheet.setStatus(problem);
     });
   },
+  extraTabs: [sessionTab],
 });
 
 const disc = createDiscView(app, {
@@ -38,11 +62,38 @@ const disc = createDiscView(app, {
   onUndo: () => {
     void engine.undo();
   },
-  onOpenSettings: () => sheet.open(),
+  onOpenSettings: () => sheet.openTab('audio'),
+  onOpenSession: () => sheet.openTab('session'),
 });
 
 engine.state.subscribe((snapshot) => disc.setSnapshot(snapshot));
 engine.level.subscribe((level) => disc.setLevel(level));
+collab.snapshot.subscribe((snapshot) => {
+  disc.setSession(snapshot);
+  // Keep the sheet's Session tab live while it is open; skip the work when closed.
+  if (sheet.isOpen()) sheet.refresh();
+});
+
+async function startSession(roomId: string): Promise<void> {
+  await collab.start(roomId);
+  // If a solo loop is already loaded, publishing it needs a live AudioContext.
+  // `ensureReady` creates/resumes what it can; any pending publish is retried by
+  // the pump on the next user gesture (see the pointerdown listener below).
+  await engine.ensureReady();
+  await collab.pumpPublic();
+}
+
+async function copyInviteLink(): Promise<void> {
+  const url = collab.shareUrl();
+  if (!url) return;
+  try {
+    await navigator.clipboard.writeText(url);
+    sheet.setStatus('Invite link copied');
+  } catch {
+    // Clipboard can be blocked; showing the link is still useful.
+    sheet.setStatus(url);
+  }
+}
 
 async function handleCalibrate(): Promise<void> {
   if (calibrating) return;
@@ -88,21 +139,34 @@ async function handleCalibrate(): Promise<void> {
   }
 }
 
-// Any pointerdown anywhere resumes a suspended context (iOS suspends on backgrounding).
+// Any pointerdown anywhere resumes a suspended context (iOS suspends on backgrounding),
+// and also flushes collaboration work that was waiting for that context.
 window.addEventListener(
   'pointerdown',
   () => {
     engine.resumeIfNeeded();
+    void collab.pumpPublic();
   },
   { capture: true },
 );
 
 // A take cannot survive the app being backgrounded (the context is suspended anyway).
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') void engine.handleBackgrounded();
-  else engine.handleForegrounded();
+  if (document.visibilityState === 'hidden') {
+    void engine.handleBackgrounded();
+  } else {
+    engine.handleForegrounded();
+    // iOS tears down sockets/PeerConnections when backgrounded; re-entering the
+    // page is the natural moment to resume fetching.
+    void collab.pumpPublic();
+  }
 });
 
 window.addEventListener('pagehide', () => {
   void engine.handleBackgrounded();
 });
+
+// Opening an invite link joins that room immediately. The AudioContext will
+// still wait for a gesture, but presence and clip metadata start syncing now.
+const initialRoom = readRoomId();
+if (initialRoom) void startSession(initialRoom);
