@@ -26,7 +26,7 @@ const sessionTab = createSessionTab({
     void startSession(generateRoomId());
   },
   onLeave: () => {
-    void collab.stop();
+    void leaveSession();
   },
   onCopyLink: () => {
     void copyInviteLink();
@@ -75,12 +75,27 @@ collab.snapshot.subscribe((snapshot) => {
 });
 
 async function startSession(roomId: string): Promise<void> {
-  await collab.start(roomId);
-  // If a solo loop is already loaded, publishing it needs a live AudioContext.
-  // `ensureReady` creates/resumes what it can; any pending publish is retried by
-  // the pump on the next user gesture (see the pointerdown listener below).
-  await engine.ensureReady();
-  await collab.pumpPublic();
+  sheet.setStatus('Starting session…');
+  try {
+    await collab.start(roomId);
+    // Deliberately *not* `engine.ensureReady()`: joining a room must not ask for
+    // microphone access. Recording opens the AudioContext as usual, and any
+    // pre-existing solo loop is picked up by the pump once a context exists
+    // (`pumpPublic` is retried on the next gesture, see the listeners below).
+    await collab.pumpPublic();
+    sheet.setStatus(null);
+  } catch (error) {
+    // A swallowed rejection here is indistinguishable from a dead button.
+    sheet.setStatus(error instanceof Error ? error.message : 'Could not start the session');
+  }
+}
+
+async function leaveSession(): Promise<void> {
+  try {
+    await collab.stop();
+  } catch (error) {
+    sheet.setStatus(error instanceof Error ? error.message : 'Could not leave the session');
+  }
 }
 
 async function copyInviteLink(): Promise<void> {

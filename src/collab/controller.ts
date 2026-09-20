@@ -23,6 +23,23 @@ import type { ClipRecord, CollabSnapshot, CommittedClip, ConnectionState, Presen
 
 /** A peer that has not been heard from for this long is considered gone. */
 const PRESENCE_TTL_MS = 15000;
+
+/**
+ * A cheap fingerprint of a snapshot, used to suppress no-op updates. Subscribers
+ * re-render UI, and a rebuild that lands between `pointerdown` and `click` eats
+ * the press — so "nothing changed" must mean "nothing is published".
+ */
+function snapshotKey(snapshot: CollabSnapshot): string {
+  const peers = snapshot.peers.map((peer) => `${peer.peerId}:${peer.name}:${peer.color}`).join(',');
+  return [
+    snapshot.active ? 'y' : 'n',
+    snapshot.roomId ?? '',
+    snapshot.connection,
+    snapshot.status ?? '',
+    snapshot.pendingClips,
+    peers,
+  ].join('|');
+}
 /** How long we keep re-asking for a blob before giving up (a peer may re-seed later). */
 const BLOB_REQUEST_TIMEOUT_MS = 20000;
 const PRESENCE_SWEEP_MS = 5000;
@@ -46,6 +63,7 @@ export class CollaborationController {
   private pruneTimer: number | null = null;
   private connection: ConnectionState = 'idle';
   private statusMessage: string | null = null;
+  private lastSnapshotKey: string | null = null;
   private pumping = false;
   private repump = false;
   private destroyed = false;
@@ -487,13 +505,20 @@ export class CollaborationController {
     const pendingClips = engine
       ? (this.store?.getClips().filter((clip) => !clip.deleted && !engine.hasLayer(clip.id)).length ?? 0)
       : 0;
-    this.snapshot.set({
+    const next: CollabSnapshot = {
       active: this.store !== null,
       roomId: this.roomId,
       connection: this.store ? this.connection : 'idle',
       peers,
       status: this.statusMessage,
       pendingClips,
-    });
+    };
+    // The pump emits on every pointerdown (it doubles as the retry trigger for
+    // gestures), so publishing an identical snapshot would re-render the sheet
+    // for no reason — and cancel whatever the user was in the middle of pressing.
+    const key = snapshotKey(next);
+    if (key === this.lastSnapshotKey) return;
+    this.lastSnapshotKey = key;
+    this.snapshot.set(next);
   }
 }

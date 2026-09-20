@@ -31,6 +31,9 @@ function formatMs(value: number | null): string {
   return `${value.toFixed(1)} ms`;
 }
 
+/** How long to wait for a press to produce its click before refreshing anyway. */
+const DEFERRED_REFRESH_MS = 400;
+
 export function createSettingsSheet(
   host: HTMLElement,
   options: SettingsSheetOptions,
@@ -176,7 +179,40 @@ export function createSettingsSheet(
   let openState = false;
   const tabButtons = new Map<string, HTMLButtonElement>();
 
+  // A re-render replaces every node in the panel. If that happens between a
+  // button's `pointerdown` and its `pointerup`, the press is lost: the browser
+  // only fires `click` when both ends of the gesture share the pressed node.
+  // Collaboration state can change at any moment (a pointerdown anywhere pumps
+  // the network, which emits a new snapshot), which silently killed every button
+  // in the sheet. Refreshes requested during a press are deferred instead.
+  let pressInFlight = false;
+  let deferredRefresh = false;
+  let deferredTimer: number | null = null;
+
+  const flushDeferredRefresh = (): void => {
+    if (deferredTimer !== null) {
+      window.clearTimeout(deferredTimer);
+      deferredTimer = null;
+    }
+    if (!deferredRefresh) return;
+    renderPanel();
+  };
+
+  /** Fallback for a press that never produces a click (dragged off, cancelled). */
+  const scheduleDeferredFlush = (): void => {
+    if (deferredTimer !== null || !deferredRefresh) return;
+    deferredTimer = window.setTimeout(() => {
+      deferredTimer = null;
+      flushDeferredRefresh();
+    }, DEFERRED_REFRESH_MS);
+  };
+
   const renderPanel = (): void => {
+    if (pressInFlight) {
+      deferredRefresh = true;
+      return;
+    }
+    deferredRefresh = false;
     panelHost.textContent = '';
     const tab = tabs.find((candidate) => candidate.id === activeTabId) ?? tabs[0];
     if (tab) tab.render(panelHost);
@@ -220,6 +256,31 @@ export function createSettingsSheet(
   };
 
   scrim.addEventListener('click', close);
+
+  // Track presses that start inside the sheet so `renderPanel` can hold off.
+  sheet.addEventListener('pointerdown', () => {
+    pressInFlight = true;
+  });
+  for (const type of ['pointerup', 'pointercancel'] as const) {
+    window.addEventListener(
+      type,
+      () => {
+        if (!pressInFlight) return;
+        pressInFlight = false;
+        // `click` (if any) arrives after this. Flushing immediately would
+        // destroy the button before it fires, so let the click flush first and
+        // keep this timer as the fallback for gestures that produce no click.
+        scheduleDeferredFlush();
+      },
+      true,
+    );
+  }
+  // Bubble phase runs after the pressed button's own click handler.
+  sheet.addEventListener('click', flushDeferredRefresh);
+  window.addEventListener('blur', () => {
+    pressInFlight = false;
+    flushDeferredRefresh();
+  });
 
   // Swipe the grab handle down to dismiss. Only the handle captures the pointer: capturing
   // on the tab bar would retarget `click` and break tab switching.
