@@ -10,6 +10,51 @@
     <meta name="color-scheme" content="dark" />
     <meta name="mobile-web-app-capable" content="yes" />
     <title>Loop Recorder</title>
+    <!--
+      Hashed bundles mean a cached copy of this page can point at a file the newest deploy
+      replaced. That failure is silent: the module never loads, so nothing ever renders and
+      `color-scheme: dark` paints a black screen with no explanation. This guard runs before
+      the bundle and turns it into a sentence and a way out. It stays out of the way when the
+      app mounts, which is the normal case.
+    -->
+    <script>
+      (function () {
+        var shown = false;
+        function show() {
+          if (shown) return;
+          var app = document.getElementById('app');
+          // Nothing to say if the app already rendered (it fills #app synchronously).
+          if (!app || app.childElementCount > 0) return;
+          shown = true;
+          var box = document.createElement('div');
+          box.style.cssText =
+            'max-width:34rem;margin:0 auto;padding:28px 20px;font:16px/1.5 system-ui,-apple-system,sans-serif;color:#e8e8ef';
+          var title = document.createElement('p');
+          title.style.cssText = 'margin:0 0 8px;font-weight:600';
+          title.textContent = 'The app did not load';
+          var body = document.createElement('p');
+          body.style.cssText = 'margin:0 0 18px;color:#a9a9bb';
+          body.textContent =
+            'A cached copy of this page is probably pointing at a file the last update replaced. Reloading usually fixes it.';
+          var button = document.createElement('button');
+          button.type = 'button';
+          button.textContent = 'Reload';
+          button.style.cssText =
+            'padding:10px 18px;border:1px solid #45455a;border-radius:9px;background:#1b1b24;color:#e8e8ef;font:inherit';
+          button.addEventListener('click', function () {
+            // Cache-bust the document itself; a plain reload can serve the cached HTML again.
+            var url = new URL(window.location.href);
+            url.searchParams.set('fresh', String(Date.now()));
+            window.location.replace(url.toString());
+          });
+          box.append(title, body, button);
+          app.append(box);
+        }
+        window.addEventListener('error', show, true);
+        window.addEventListener('unhandledrejection', show);
+        window.setTimeout(show, 3000);
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>
