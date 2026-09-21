@@ -176,15 +176,22 @@ export function createDiscView(root: HTMLElement, handlers: DiscHandlers): DiscV
     setSession(snapshot) {
       if (!snapshot.active) {
         sessionPill.hidden = true;
+        sessionPill.classList.remove('is-recording');
+        sessionPill.title = '';
         return;
       }
       const total = snapshot.peers.length + 1;
       sessionPill.hidden = false;
+      // The pill stays the session's own indicator: someone else recording adds a class (and
+      // therefore a dot) and a line to the title, but never replaces what the pill shows.
       sessionPill.textContent = snapshot.connection === 'live' ? `\u25cf ${total}` : '\u25cc';
       sessionPill.classList.toggle('is-live', snapshot.connection === 'live');
+      const remoteRecording = snapshot.remoteRecording;
+      sessionPill.classList.toggle('is-recording', remoteRecording !== null);
       const parts: string[] = [
         total === 1 ? 'Live session — waiting for others' : `${total} in this session`,
       ];
+      if (remoteRecording) parts.push(`${remoteRecording.name} is recording now`);
       if (snapshot.pendingClips > 0) parts.push(`fetching ${snapshot.pendingClips} clip(s)`);
       if (snapshot.status) parts.push(snapshot.status);
       sessionPill.title = parts.join(' · ');

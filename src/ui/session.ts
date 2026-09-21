@@ -33,6 +33,11 @@ function peerDot(color: string): HTMLSpanElement {
   return dot;
 }
 
+/** Whole seconds since a claim was made or refreshed; never negative, even with clock skew. */
+function secondsSince(at: number): number {
+  return Math.max(0, Math.round((Date.now() - at) / 1000));
+}
+
 export function createSessionTab(options: SessionTabOptions): SheetTab {
   return {
     id: 'session',
@@ -53,6 +58,30 @@ export function createSessionTab(options: SessionTabOptions): SheetTab {
         : CONNECTION_LABEL[snapshot.connection];
       statusField.append(statusLabel, statusValue);
       panel.append(statusField);
+
+      // "Someone else is recording" is information, not a lock: a take here is always
+      // allowed, so this is an ordinary field and never a warning.
+      const remote = snapshot.remoteRecording;
+      if (remote) {
+        const recordingField = document.createElement('div');
+        recordingField.className = 'field';
+        const recordingLabel = document.createElement('span');
+        recordingLabel.className = 'field-label';
+        recordingLabel.textContent = 'Recording now';
+        const recordingValue = document.createElement('span');
+        recordingValue.className = 'field-value';
+        const recordingName = document.createElement('span');
+        recordingName.textContent = remote.name;
+        recordingName.style.color = remote.color;
+        const recordingAge = document.createElement('span');
+        recordingAge.style.color = 'var(--muted)';
+        recordingAge.style.marginLeft = '6px';
+        // The claim is refreshed while their take runs, so this is "since they last said so".
+        recordingAge.textContent = `${secondsSince(remote.since)} s ago`;
+        recordingValue.append(peerDot(remote.color), recordingName, recordingAge);
+        recordingField.append(recordingLabel, recordingValue);
+        panel.append(recordingField);
+      }
 
       if (snapshot.active) {
         const roomField = document.createElement('div');

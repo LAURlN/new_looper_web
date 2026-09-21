@@ -509,6 +509,20 @@ body {
   border-color: rgba(72, 213, 151, 0.45);
 }
 
+/* Another peer is recording right now. A hint on the pill, never a block: their take and
+   ours are merged by the shared document regardless of this. */
+.pill.is-recording {
+  border-color: rgba(255, 59, 48, 0.55);
+}
+
+.pill.is-recording::after {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--record);
+}
+
 .peers {
   list-style: none;
   margin: 0;

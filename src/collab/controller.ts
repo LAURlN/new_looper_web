@@ -19,10 +19,25 @@ import { loadIdentity, type PeerIdentity } from './identity';
 import { ProjectStore } from './projectStore';
 import { P2PTransport, type JsonRecord, type TransportHandlers } from './transport';
 import { buildShareUrl, clearRoomId, setRoomId } from './room';
-import type { ClipRecord, CollabSnapshot, CommittedClip, ConnectionState, PresencePeer } from './types';
+import type {
+  ClipRecord,
+  CollabSnapshot,
+  CommittedClip,
+  ConnectionState,
+  PresencePeer,
+  RemoteRecording,
+} from './types';
 
 /** A peer that has not been heard from for this long is considered gone. */
 const PRESENCE_TTL_MS = 15000;
+
+/**
+ * How often a device that is still recording pushes its claim's `at` forward.
+ *
+ * A refresh is a single key in a single map, so it is cheap enough to run blind while a take
+ * lasts — and it is what separates "still recording" from "gone" for everyone else.
+ */
+const RECORD_LOCK_REFRESH_MS = 15000;
 
 /**
  * A cheap fingerprint of a snapshot, used to suppress no-op updates. Subscribers
@@ -31,12 +46,16 @@ const PRESENCE_TTL_MS = 15000;
  */
 function snapshotKey(snapshot: CollabSnapshot): string {
   const peers = snapshot.peers.map((peer) => `${peer.peerId}:${peer.name}:${peer.color}`).join(',');
+  // `since` is part of the key on purpose: a holder refreshes every 15 s, and the Session
+  // tab shows how long ago that was, so the rendering has to follow the claim.
+  const remote = snapshot.remoteRecording;
   return [
     snapshot.active ? 'y' : 'n',
     snapshot.roomId ?? '',
     snapshot.connection,
     snapshot.status ?? '',
     snapshot.pendingClips,
+    remote ? `${remote.name}:${remote.color}:${remote.since}` : '',
     peers,
   ].join('|');
 }
@@ -74,8 +93,13 @@ export class CollaborationController {
   private detachDocUpdate: (() => void) | null = null;
   private detachClips: (() => void) | null = null;
   private detachHeader: (() => void) | null = null;
+  private detachRecordLock: (() => void) | null = null;
   private pruneTimer: number | null = null;
   private pulseTimer: number | null = null;
+  /** Exists only while a local take is running, and only while there is a room to tell. */
+  private recordLockTimer: number | null = null;
+  /** The non-fatal "recording too" line, kept so it can be retired without clobbering a warning. */
+  private remoteRecordNote: string | null = null;
   private connection: ConnectionState = 'idle';
   private statusMessage: string | null = null;
   private lastSnapshotKey: string | null = null;
@@ -92,6 +116,7 @@ export class CollaborationController {
       peers: [],
       status: null,
       pendingClips: 0,
+      remoteRecording: null,
     });
   }
 
@@ -121,6 +146,89 @@ export class CollaborationController {
     engine.onClipRemoved((clipId) => {
       this.store?.tombstoneClip(clipId);
     });
+    // The engine's take edges are the only honest trigger for the lease. Both handlers do
+    // nothing without a room (see `claimRecordLock`), which is what keeps solo use free of
+    // lock writes and timers.
+    engine.onTakeStarted(() => this.claimRecordLock());
+    engine.onTakeEnded(() => this.releaseRecordLock());
+  }
+
+  // ------------------------------------------------------------ recording lease
+
+  /**
+   * Publishes "this device is recording right now" into the shared document.
+   *
+   * Nothing here can refuse a take: the claim is an indication, not a guard. The clip this
+   * device is recording is merged by the document exactly as it would be otherwise, and a
+   * peer that happens to be recording at the same moment simply says so.
+   */
+  private claimRecordLock(): void {
+    const store = this.store;
+    if (!store) return; // solo: no room, so no claim write and no timer
+    // Read the other device's claim *before* writing ours, so the sentence describes the
+    // room as the user found it.
+    const other = this.remoteRecording();
+    if (other) {
+      this.remoteRecordNote = `${other.name} is recording too — your take will be added alongside.`;
+      this.statusMessage = this.remoteRecordNote;
+    }
+    store.claimRecordLock({
+      identityId: this.identity.id,
+      name: this.identity.name,
+      color: this.identity.color,
+    });
+    this.startRecordLockRefresh(store);
+    this.emit();
+  }
+
+  /**
+   * Drops the claim. Every way a take can end lands here — commit, discard, abort — and so
+   * do `stop()` and `destroy()`, because leaving a session must never leave the indicator
+   * lit on the other phone.
+   */
+  private releaseRecordLock(): void {
+    if (this.recordLockTimer !== null) {
+      window.clearInterval(this.recordLockTimer);
+      this.recordLockTimer = null;
+    }
+    // The store only honours a release from the holder, so a late or duplicated release can
+    // never clear a claim that has meanwhile been taken over by somebody else.
+    this.store?.releaseRecordLock(this.identity.id);
+    // Retire the "recording too" line, but only while it is still the message on screen: a
+    // real warning written during the take has to survive.
+    if (this.remoteRecordNote !== null && this.statusMessage === this.remoteRecordNote) {
+      this.statusMessage = null;
+    }
+    this.remoteRecordNote = null;
+    this.emit();
+  }
+
+  /**
+   * Keeps the claim unexpired for as long as the take lasts.
+   *
+   * One refresh is a single key write, so it is cheap enough to run blind — and it is the
+   * only thing that tells "still recording" apart from "gone", so a five-minute take stays
+   * visible while a phone that died quietly stops being after a minute.
+   */
+  private startRecordLockRefresh(store: ProjectStore): void {
+    if (this.recordLockTimer !== null) return;
+    this.recordLockTimer = window.setInterval(
+      () => store.refreshRecordLock(this.identity.id),
+      RECORD_LOCK_REFRESH_MS,
+    );
+  }
+
+  /**
+   * Another peer's unexpired claim, or `null`.
+   *
+   * Expiry is applied on read, so a holder that vanishes needs no cleanup message from
+   * anyone. A claim of our own is filtered out here: this device must never report its own
+   * take as "someone else is recording".
+   */
+  private remoteRecording(): RemoteRecording | null {
+    const lock = this.store?.getRecordLock() ?? null;
+    if (!lock || lock.identityId === this.identity.id) return null;
+    return { name: lock.name, color: lock.color, since: lock.at };
   }
 
   async start(roomId: string): Promise<void> {
@@ -156,6 +264,10 @@ export class CollaborationController {
       void this.pump();
     });
 
+    // The lease is an ordinary document write, so a remote claim arrives through the same
+    // update path as everything else — this subscription is what turns it into UI.
+    this.detachRecordLock = store.recordLock.subscribe(() => this.emit());
+
     this.detachDocUpdate = store.onDocUpdate((update, origin) => {
       // Flood each update onward, except back to the peer it came from. Yjs
       // updates are idempotent, so duplicates are no-ops and the flood settles.
@@ -178,6 +290,9 @@ export class CollaborationController {
   }
 
   async stop(): Promise<void> {
+    // Release first, while the transport is still up, so the other phone hears about it
+    // immediately instead of waiting out the TTL.
+    this.releaseRecordLock();
     if (this.pruneTimer !== null) {
       window.clearInterval(this.pruneTimer);
       this.pruneTimer = null;
@@ -192,6 +307,8 @@ export class CollaborationController {
     this.detachClips = null;
     this.detachHeader?.();
     this.detachHeader = null;
+    this.detachRecordLock?.();
+    this.detachRecordLock = null;
 
     this.transport?.stop();
     this.transport = null;
@@ -693,7 +810,12 @@ export class CollaborationController {
         changed = true;
       }
     }
-    if (changed) this.emit();
+    // This sweep is the only clock that runs while a session is otherwise idle, so it is
+    // also what retires a recording lease nobody released: once the claim is older than its
+    // TTL it reads as no claim, and re-publishing is what makes that visible. `emit()`
+    // de-duplicates, so re-running it while somebody is legitimately recording changes
+    // nothing.
+    if (changed || this.snapshot.get().remoteRecording !== null) this.emit();
   }
 
   private emit(): void {
@@ -717,6 +839,7 @@ export class CollaborationController {
       peers,
       status: this.statusMessage,
       pendingClips,
+      remoteRecording: this.remoteRecording(),
     };
     // The pump emits on every pointerdown (it doubles as the retry trigger for
     // gestures), so publishing an identical snapshot would re-render the sheet

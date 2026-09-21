@@ -17,7 +17,14 @@
 import * as Y from 'yjs';
 import { IndexeddbPersistence } from 'y-indexeddb';
 import { Observable } from '../util/observable';
-import { SCHEMA_VERSION, type CanonicalResult, type ClipMeta, type ClipRecord, type ProjectHeader } from './types';
+import {
+  SCHEMA_VERSION,
+  type CanonicalResult,
+  type ClipMeta,
+  type ClipRecord,
+  type ProjectHeader,
+  type RecordLock,
+} from './types';
 
 const CLIP_FIELD_DEFAULTS = {
   authorId: '',
@@ -35,6 +42,24 @@ export const CLIPS_ARRAY = 'clips';
 /** Reserved extension points — unused today, but present so the shape is stable. */
 export const FEATURES_MAP = 'features';
 export const EVENTS_ARRAY = 'events';
+/**
+ * The recording lease. Deliberately a top-level map of its own rather than part of the
+ * project header: it is ephemeral session state ("who is recording *right now*"), and
+ * mixing it into the header would make it look like project metadata — and would make
+ * every claim and refresh look like a project edit to anyone reading the document.
+ *
+ * It is also additive, so an older client that never reads this map simply ignores it.
+ */
+export const RECORD_LOCK_MAP = 'recordLock';
+
+/**
+ * How old a claim may be before it reads as no claim at all.
+ *
+ * This is the whole point of a lease: a phone that dies, backgrounds or loses its
+ * connection mid-take stops being reported after a minute without anyone sending
+ * anything. A peer that is still recording keeps its claim alive by refreshing it.
+ */
+export const RECORD_LOCK_TTL_MS = 60000;
 
 export const DEFAULT_PROJECT_NAME = 'Untitled loop';
 
@@ -68,19 +93,31 @@ export class ProjectStore {
   readonly doc: Y.Doc;
   readonly clips: Observable<ClipRecord[]>;
   readonly header: Observable<ProjectHeader>;
+  /**
+   * The recording lease as of its last change, or `null` when nobody holds it.
+   *
+   * This is the *change signal*: a remote claim arrives as an ordinary document update, so
+   * subscribing here is what surfaces it. Reads that need a claim to be current go through
+   * `getRecordLock()`, which re-evaluates expiry against the wall clock.
+   */
+  readonly recordLock: Observable<RecordLock | null>;
 
   private readonly projectMap: Y.Map<unknown>;
   private readonly clipsArray: Y.Array<Y.Map<unknown>>;
+  private readonly recordLockMap: Y.Map<unknown>;
   private readonly persistence: IndexeddbPersistence | null;
   private readonly emitClips: () => void;
   private readonly emitHeader: () => void;
+  private readonly emitRecordLock: () => void;
 
   constructor(roomId: string, projectName = DEFAULT_PROJECT_NAME) {
     this.doc = new Y.Doc();
     this.projectMap = this.doc.getMap(PROJECT_MAP);
     this.clipsArray = this.doc.getArray<Y.Map<unknown>>(CLIPS_ARRAY);
+    this.recordLockMap = this.doc.getMap(RECORD_LOCK_MAP);
 
     this.clips = new Observable<ClipRecord[]>([]);
+    this.recordLock = new Observable<RecordLock | null>(null);
     this.header = new Observable<ProjectHeader>({
       id: roomId,
       name: projectName,
@@ -101,8 +138,10 @@ export class ProjectStore {
 
     this.emitClips = () => this.clips.set(this.snapshotClips());
     this.emitHeader = () => this.header.set(this.snapshotHeader());
+    this.emitRecordLock = () => this.recordLock.set(this.getRecordLock());
     this.clipsArray.observeDeep(this.emitClips);
     this.projectMap.observe(this.emitHeader);
+    this.recordLockMap.observe(this.emitRecordLock);
 
     if (typeof indexedDB !== 'undefined') {
       let persistence: IndexeddbPersistence | null = null;
@@ -119,6 +158,7 @@ export class ProjectStore {
     // Reflect anything already stored before the observers were attached.
     this.emitClips();
     this.emitHeader();
+    this.emitRecordLock();
   }
 
   /** Resolves once the local IndexedDB copy has been loaded. */
@@ -131,6 +171,7 @@ export class ProjectStore {
     }
     this.emitClips();
     this.emitHeader();
+    this.emitRecordLock();
   }
 
   private snapshotClips(): ClipRecord[] {
@@ -228,6 +269,81 @@ export class ProjectStore {
     }
   }
 
+  // -------------------------------------------------------- recording lease
+
+  /**
+   * The lease, or `null` when there is none — or when the one stored has run out.
+   *
+   * Expiry is evaluated here, on read, rather than by deleting anything: a device that
+   * crashes or is closed mid-take can never send a release, so a claim that outlived its
+   * holder would make the room look busy forever. Reading the wall clock instead means the
+   * lease retires itself for every peer, with no traffic and no timer on their side.
+   */
+  getRecordLock(): RecordLock | null {
+    const lock = this.readRecordLock();
+    if (!lock) return null;
+    return Date.now() - lock.at >= RECORD_LOCK_TTL_MS ? null : lock;
+  }
+
+  /**
+   * Claims (or re-claims) the lease for `identity`.
+   *
+   * The write is deliberately four plain `Y.Map` sets. Two peers claiming at the same
+   * moment is a genuine race, and Yjs already has a deterministic answer for it: the
+   * concurrent write to a key with the higher client id wins. Because both sides write the
+   * same four keys, every key resolves to the same winner, so both devices agree on one
+   * holder — we do not need (and must not invent) a second tie-break.
+   */
+  claimRecordLock(identity: Pick<RecordLock, 'identityId' | 'name' | 'color'>): void {
+    this.doc.transact(() => {
+      this.recordLockMap.set('identityId', identity.identityId);
+      this.recordLockMap.set('name', identity.name);
+      this.recordLockMap.set('color', identity.color);
+      this.recordLockMap.set('at', Date.now());
+    });
+  }
+
+  /**
+   * Pushes `at` forward without changing who holds the claim.
+   *
+   * Only the holder may refresh — checked against the stored identity id, so a device that
+   * lost a concurrent claim cannot hijack the lease from the winner later.
+   */
+  refreshRecordLock(identityId: string): void {
+    if (this.recordLockMap.get('identityId') !== identityId) return;
+    this.recordLockMap.set('at', Date.now());
+  }
+
+  /**
+   * Releases the claim, but only for its holder.
+   *
+   * The same identity check guards the release as guards the refresh: a stale or duplicated
+   * release (say, from a take that ended after the claimant already left) must never clear a
+   * claim that has since moved on to someone else.
+   */
+  releaseRecordLock(identityId: string): void {
+    if (this.recordLockMap.get('identityId') !== identityId) return;
+    const keys = [...this.recordLockMap.keys()];
+    this.doc.transact(() => {
+      // Delete every key rather than leaving `at` behind: a partial claim would read as
+      // no claim anyway, but an empty map is the honest representation of "nobody".
+      for (const key of keys) this.recordLockMap.delete(key);
+    });
+  }
+
+  private readRecordLock(): RecordLock | null {
+    const identityId = this.recordLockMap.get('identityId');
+    if (typeof identityId !== 'string' || !identityId) return null;
+    return {
+      identityId,
+      name: asString(this.recordLockMap.get('name'), ''),
+      color: asString(this.recordLockMap.get('color'), '#4da3ff'),
+      // A missing `at` reads as 0, which is ancient — i.e. a half-written claim from an
+      // unknown client expires immediately instead of looking like a live recording.
+      at: asNumber(this.recordLockMap.get('at')),
+    };
+  }
+
   // ------------------------------------------------------------------ sync
 
   encodeState(): Uint8Array {
@@ -255,6 +371,7 @@ export class ProjectStore {
   destroy(): void {
     this.clipsArray.unobserveDeep(this.emitClips);
     this.projectMap.unobserve(this.emitHeader);
+    this.recordLockMap.unobserve(this.emitRecordLock);
     void this.persistence?.destroy();
     this.doc.destroy();
   }

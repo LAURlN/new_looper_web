@@ -78,6 +78,35 @@ export interface PresencePeer {
   lastSeen: number;
 }
 
+/**
+ * The "someone is recording right now" claim, as it is stored in the shared document.
+ *
+ * A lease, not a lock: `at` is pushed forward while the take runs, and a claim older than
+ * the read-side TTL reads as no claim at all. That is what makes a device which dies,
+ * backgrounds or drops its connection mid-take harmless after a minute — with no delete
+ * message and no cleanup traffic from anyone.
+ */
+export interface RecordLock {
+  /** Identity id of the claimant — the only identity allowed to refresh or release it. */
+  identityId: string;
+  name: string;
+  color: string;
+  /** `Date.now()` on the claiming device, refreshed while its take runs. */
+  at: number;
+}
+
+/**
+ * An unexpired claim held by *another* peer, as the UI reads it.
+ *
+ * Purely informative: a local take is never refused, queued or delayed because of it.
+ */
+export interface RemoteRecording {
+  name: string;
+  color: string;
+  /** `Date.now()` of the holder's most recent claim or refresh. */
+  since: number;
+}
+
 /** Coarse connection state for the session UI. */
 export type ConnectionState = 'idle' | 'searching' | 'live' | 'error';
 
@@ -92,6 +121,8 @@ export interface CollabSnapshot {
   status: string | null;
   /** How much is still arriving, so the UI can show "fetching audio…". */
   pendingClips: number;
+  /** Another peer recording right now, or null. Never set for this device's own claim. */
+  remoteRecording: RemoteRecording | null;
 }
 
 /** Result of trying to claim the set-once shared loop length. */

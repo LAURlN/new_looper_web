@@ -36,6 +36,11 @@ const MIN_CYCLE_LEAD_SECONDS = 0.02;
 /** A take this quiet is treated as "the microphone heard nothing". */
 const SILENT_TAKE_PEAK = 0.01;
 
+/** The two states in which a take is actively capturing audio. */
+function isTakeState(state: EngineStateName): boolean {
+  return state === 'RECORDING' || state === 'OVERDUBBING';
+}
+
 /** Layer ids replicate across peers, so they must be globally unique strings. */
 function newLayerId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -134,6 +139,8 @@ export class LoopEngine {
   private localAuthorId = 'local';
   private commitHook: ((clip: CommittedClip) => void) | null = null;
   private removeHook: ((clipId: string) => void) | null = null;
+  private takeStartHook: (() => void) | null = null;
+  private takeEndHook: (() => void) | null = null;
   private transitioning = false;
   private fatal: string | null = null;
   private wakeLock: WakeLockSentinelLike | null = null;
@@ -428,6 +435,24 @@ export class LoopEngine {
   /** Called when a local layer is removed, so the shared document can tombstone it. */
   onClipRemoved(hook: ((clipId: string) => void) | null): void {
     this.removeHook = hook;
+  }
+
+  /**
+   * Called when a pass starts capturing — the edge into `RECORDING`/`OVERDUBBING`.
+   *
+   * Optional and unset by default, so solo use is unchanged; the collaboration layer is
+   * what turns this edge into a replicated "recording now" claim.
+   */
+  onTakeStarted(hook: (() => void) | null): void {
+    this.takeStartHook = hook;
+  }
+
+  /**
+   * Called when a pass stops capturing — however it ends: committed, discarded by `undo()`,
+   * aborted, or dropped because the app went to the background.
+   */
+  onTakeEnded(hook: (() => void) | null): void {
+    this.takeEndHook = hook;
   }
 
   hasAudioContext(): boolean {
@@ -974,6 +999,10 @@ export class LoopEngine {
   }
 
   private setState(next: EngineStateName, patch: Partial<EngineSnapshot> = {}): void {
+    // Every take transition passes through here, which makes it the one place the
+    // "recording" edges can be detected without touching the recording path itself.
+    const wasCapturing = isTakeState(this.state.get().state);
+    const nowCapturing = isTakeState(next);
     this.patch({
       state: next,
       layerCount: this.layers.length,
@@ -981,6 +1010,13 @@ export class LoopEngine {
       loopSeconds: this.loopSeconds(),
       ...patch,
     });
+    // Comparing the two states is what keeps the edges honest: a `setState` that repeats
+    // the *same* capturing state (which happens mid-take when a distant layer arrives) fires
+    // nothing, and returning to a non-capturing state fires the end exactly once — whether
+    // the take was committed, discarded by `undo()`, aborted or ended by backgrounding.
+    // With no hook set this is one boolean comparison, so solo use is untouched.
+    if (nowCapturing && !wasCapturing) this.takeStartHook?.();
+    else if (!nowCapturing && wasCapturing) this.takeEndHook?.();
   }
 
   private loopSeconds(): number | null {
