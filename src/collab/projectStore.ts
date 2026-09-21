@@ -209,6 +209,54 @@ export class ProjectStore {
     return this.header.get();
   }
 
+  /**
+   * Facts about the document itself, for the diagnostics report. Read-only, no side effects.
+   *
+   * Two of these exist to separate failures that look identical from the outside. `rawClips`
+   * and `filteredClips` tell "the clip never arrived" apart from "it arrived and `toRecord()`
+   * discarded it" — the Observable the UI reads only ever holds the filtered value.
+   * `pendingStructs` and `bytes` tell "the update was dropped on the wire" apart from "it
+   * arrived and Yjs could not integrate it", which is what an update applied without error
+   * and without effect actually is.
+   */
+  debugFacts(): {
+    clientID: number;
+    bytes: number;
+    rawClips: number;
+    filteredClips: number;
+    clipIds: string[];
+    blobHashes: string[];
+    firstClip: string;
+    pendingStructs: boolean;
+    header: ProjectHeader;
+  } {
+    const filtered = this.snapshotClips();
+    let firstClip = 'none';
+    for (const item of this.clipsArray) {
+      if (item instanceof Y.Map) {
+        try {
+          firstClip = JSON.stringify(item.toJSON());
+        } catch {
+          firstClip = '(unserialisable)';
+        }
+        break;
+      }
+    }
+    return {
+      clientID: this.doc.clientID,
+      bytes: Y.encodeStateAsUpdate(this.doc).byteLength,
+      rawClips: this.clipsArray.length,
+      filteredClips: filtered.length,
+      clipIds: filtered.map((clip) => clip.id),
+      blobHashes: [...new Set(filtered.map((clip) => clip.blobHash))],
+      firstClip,
+      pendingStructs: Boolean(
+        (this.doc.store as unknown as { pendingStructs?: unknown }).pendingStructs,
+      ),
+      header: this.snapshotHeader(),
+    };
+  }
+
   setProjectName(name: string): void {
     const trimmed = name.trim();
     if (!trimmed) return;

@@ -65,6 +65,15 @@ function errorText(error: unknown): string {
 }
 
 /**
+ * How many transports this page has created.
+ *
+ * One per session is correct. More than one means the page joined twice — and because Trystero
+ * hands back the same room object for a repeated join, the second join would overwrite the
+ * first one's message handlers, which looks exactly like "the document never arrives".
+ */
+let transportStarts = 0;
+
+/**
  * Minimum gap between two `blob-want` asks for the same hash.
  *
  * This is a throttle, not a deadline: hammering the room is pointless, but an
@@ -171,6 +180,10 @@ export class CollaborationController {
     const header = store ? store.getHeader() : null;
     const clips = store ? store.getClips() : [];
     const deleted = clips.filter((clip) => clip.deleted).length;
+    // The document read directly, as well as through the Observable the UI displays: an id
+    // present in `clipsArray` but absent from `clips` means the write arrived and was
+    // filtered out, which is a different bug from the write never arriving at all.
+    const facts = store ? store.debugFacts() : null;
 
     let canonical = 'none';
     if (header && header.sampleRate && header.cycleFrames) {
@@ -199,6 +212,12 @@ export class CollaborationController {
         this.transport ? this.transport.peerIds.length : 0
       }   presence peers: ${this.presencePeers.size}`,
       `doc: clips ${clips.length} (deleted ${deleted})   canonical loop: ${canonical}`,
+      `doc raw: ${facts ? facts.rawClips : '-'} in the array, ${facts ? facts.filteredClips : '-'} after filtering, ${facts ? facts.bytes : '-'} bytes, clientID ${facts ? facts.clientID : '-'}, pending structs: ${facts ? (facts.pendingStructs ? 'YES' : 'no') : '-'}`,
+      `header raw: sampleRate ${facts ? String(facts.header.sampleRate) : '-'}, cycleFrames ${facts ? String(facts.header.cycleFrames) : '-'}, project id ${facts ? facts.header.id : '-'}`,
+      `doc clip ids: ${facts && facts.clipIds.length > 0 ? facts.clipIds.join(', ') : 'none'}`,
+      `doc blob hashes: ${facts && facts.blobHashes.length > 0 ? facts.blobHashes.join(', ') : 'none'}`,
+      `doc first clip: ${facts ? facts.firstClip : '-'}`,
+      `transports started this page: ${transportStarts}`,
       `engine: loop ${loop}   shared loop: ${
         engine && engine.hasSharedLoop() ? 'yes' : 'no'
       }   state: ${engine ? engine.state.get().state : 'n/a'}   context: ${context}`,
@@ -361,6 +380,7 @@ export class CollaborationController {
 
     const transport = new P2PTransport(roomId, this.identity, this.buildHandlers());
     this.transport = transport;
+    transportStarts++;
     transport.start();
 
     this.pruneTimer = window.setInterval(() => this.prunePresence(), PRESENCE_SWEEP_MS);
