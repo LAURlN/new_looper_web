@@ -73,6 +73,7 @@ export class CollaborationController {
   private roomId: string | null = null;
   private detachDocUpdate: (() => void) | null = null;
   private detachClips: (() => void) | null = null;
+  private detachHeader: (() => void) | null = null;
   private pruneTimer: number | null = null;
   private pulseTimer: number | null = null;
   private connection: ConnectionState = 'idle';
@@ -145,6 +146,16 @@ export class CollaborationController {
       this.emit();
     });
 
+    // The set-once loop length lives in the header, and until now nothing ever read it
+    // back — a device that joined without a loop of its own never learned the session's
+    // cycle. Subscribing fires once immediately (so a length already persisted in
+    // IndexedDB is picked up too), and on every later header change the engine adopts the
+    // canonical length before the clips that depend on it are re-evaluated.
+    this.detachHeader = store.header.subscribe(() => {
+      this.adoptCanonicalLoop();
+      void this.pump();
+    });
+
     this.detachDocUpdate = store.onDocUpdate((update, origin) => {
       // Flood each update onward, except back to the peer it came from. Yjs
       // updates are idempotent, so duplicates are no-ops and the flood settles.
@@ -179,6 +190,8 @@ export class CollaborationController {
     this.detachDocUpdate = null;
     this.detachClips?.();
     this.detachClips = null;
+    this.detachHeader?.();
+    this.detachHeader = null;
 
     this.transport?.stop();
     this.transport = null;
@@ -286,11 +299,80 @@ export class CollaborationController {
   }
 
   private claimLoop(store: ProjectStore, sampleRate: number, cycleFrames: number): void {
-    if (store.ensureCanonical(sampleRate, cycleFrames) === 'conflict') {
-      this.statusMessage =
-        'Two different loop lengths were recorded at the same time. Clips for the other length will be skipped.';
-      this.emit();
+    if (store.ensureCanonical(sampleRate, cycleFrames) !== 'conflict') return;
+    // The header already owns a different length. Say which two lengths are in play and
+    // what the way out is — the same wording the read side uses, so the user reads one
+    // story about the conflict rather than two differently worded ones.
+    const header = store.getHeader();
+    const headerRate = header.sampleRate;
+    const headerFrames = header.cycleFrames;
+    const hasCanonical =
+      headerRate !== null && headerRate > 0 && headerFrames !== null && headerFrames > 0;
+    this.statusMessage =
+      hasCanonical && sampleRate > 0
+        ? this.conflictMessage(headerFrames / headerRate, cycleFrames / sampleRate)
+        : 'This device has a loop of a different length than the session. Undo your layers to join the session loop.';
+    this.emit();
+  }
+
+  /** One wording for the "two loop lengths" conflict, shared by the writer and the reader side. */
+  private conflictMessage(sessionSeconds: number, deviceSeconds: number): string {
+    return `This device has a loop of a different length (${deviceSeconds.toFixed(1)} s) than the session (${sessionSeconds.toFixed(1)} s). Undo your layers to join the session loop.`;
+  }
+
+  // ----------------------------------------------------------- canonical loop
+
+  /**
+   * The read side of the set-once loop length.
+   *
+   * `ensureCanonical()` has always written `sampleRate`/`cycleFrames` into the header and
+   * those values replicate and merge correctly — but nothing ever consulted them, so a
+   * device that joined a room without a loop of its own never learned the session's cycle.
+   * This turns that stored value into a loop the engine can actually play.
+   *
+   * The header holds the *writing* device's hardware rate, while a loop on this device is
+   * always expressed in this context's frames, so the length is converted by the ratio of
+   * the two rates: a 3.4 s cycle is `3.4 * localRate` frames here, whatever the two
+   * contexts happen to run at. (`decodeClip()` already puts arriving audio at the local
+   * rate, so the rates themselves never have to be reconciled anywhere else.)
+   */
+  private adoptCanonicalLoop(): void {
+    const store = this.store;
+    const engine = this.engine;
+    // Without a context there is nowhere to anchor a cycle; the next pump after the
+    // context exists adopts it instead — which is why `pumpOnce()` calls this too.
+    if (!store || !engine || !engine.hasAudioContext()) return;
+    const header = store.getHeader();
+    const headerRate = header.sampleRate;
+    const headerFrames = header.cycleFrames;
+    if (headerRate === null || headerRate <= 0) return;
+    if (headerFrames === null || headerFrames <= 0) return;
+    const localRate = engine.getSampleRate();
+    if (localRate === null) return;
+
+    const canonicalSeconds = headerFrames / headerRate;
+    const localFrames = Math.round((headerFrames * localRate) / headerRate);
+    if (engine.adoptSharedLoop(localFrames)) {
+      // Announce only a real adoption: the header re-emits on every project edit and this
+      // also runs on every pump, so an unconditional message would be constant noise.
+      this.statusMessage = `Joined the shared loop: ${canonicalSeconds.toFixed(1)} s`;
+      return;
     }
+
+    const localLoopFrames = engine.getLoopLengthFrames();
+    if (localLoopFrames <= 0) return;
+    // A cycle that already came from the shared state is the same loop — any difference is
+    // just the rounding of the rate conversion above.
+    if (engine.hasSharedLoop()) return;
+    const localSeconds = localLoopFrames / localRate;
+    if (Math.abs(localSeconds - canonicalSeconds) <= Math.max(0.002, canonicalSeconds * 0.01)) {
+      return;
+    }
+    // This device is holding a loop it defined before the session's length was known. The
+    // canonical value wins, but the engine deliberately refuses to clobber audible work,
+    // so the way out is to undo the layers that defined the local loop. Clips skipped for
+    // this reason stay non-sticky: every later pass re-evaluates them once it is resolved.
+    this.statusMessage = this.conflictMessage(canonicalSeconds, localSeconds);
   }
 
   // ------------------------------------------------------------ ingestion
@@ -325,6 +407,12 @@ export class CollaborationController {
     const store = this.store;
     const engine = this.engine;
     if (!store || !engine) return;
+
+    // Read the canonical length back before anything is compared against it: this is what
+    // turns "the header says 3.4 s" into "this engine is cycling 3.4 s". Running it on
+    // every pass is what lets a context created *after* the header still adopt the loop,
+    // and it is cheap: it never throws and never clobbers a loop this device owns.
+    this.adoptCanonicalLoop();
 
     // Share anything recorded before the session existed. Needs a sample rate,
     // which only exists with a context; it returns early on its own and must not
@@ -381,15 +469,39 @@ export class CollaborationController {
     }
   }
 
-  /** A clip only joins the live loop if its duration matches the shared loop. */
+  /**
+   * A clip only joins the live loop if its duration matches the shared loop.
+   *
+   * The reference is the header's set-once `sampleRate`/`cycleFrames`, not this device's
+   * own engine: a joiner that has not adopted the canonical length yet must still accept
+   * the session's clips, and a device that recorded a first take of its own must not
+   * reject every clip recorded at the session's length for the rest of the session. The
+   * local loop is only a fallback for the moment before a canonical length exists.
+   *
+   * After `decodeClip()` a clip is already at this context's sample rate, so only the
+   * *duration* can differ between peers — never the rate.
+   */
   private isCompatible(engine: LoopEngine, clip: ClipRecord): boolean {
     if (clip.sampleRate <= 0 || clip.cycleFrames <= 0) return false;
-    if (engine.getLoopLengthFrames() <= 0) return true; // this clip defines the loop
-    const rate = engine.getSampleRate();
-    if (rate === null) return false;
-    const localSeconds = engine.getLoopLengthFrames() / rate;
+    const header = this.store ? this.store.getHeader() : null;
+    const headerRate = header ? header.sampleRate : null;
+    const headerFrames = header ? header.cycleFrames : null;
+    const canonicalSeconds =
+      headerRate !== null && headerRate > 0 && headerFrames !== null && headerFrames > 0
+        ? headerFrames / headerRate
+        : null;
     const clipSeconds = clip.cycleFrames / clip.sampleRate;
-    return Math.abs(clipSeconds - localSeconds) <= Math.max(0.002, localSeconds * 0.01);
+
+    if (canonicalSeconds === null) {
+      // Nothing canonical yet, so this clip is a candidate to define the loop.
+      if (engine.getLoopLengthFrames() <= 0) return true;
+      const rate = engine.getSampleRate();
+      if (rate === null) return false;
+      const localSeconds = engine.getLoopLengthFrames() / rate;
+      return Math.abs(clipSeconds - localSeconds) <= Math.max(0.002, localSeconds * 0.01);
+    }
+
+    return Math.abs(clipSeconds - canonicalSeconds) <= Math.max(0.002, canonicalSeconds * 0.01);
   }
 
   /**
@@ -587,8 +699,16 @@ export class CollaborationController {
   private emit(): void {
     const engine = this.engine;
     const peers = [...this.presencePeers.values()].sort((a, b) => a.name.localeCompare(b.name));
+    // Clips still expected to join the loop. One this device has proven it cannot decode
+    // never will, so counting it would leave the sheet saying "fetching audio…" forever;
+    // a clip skipped for a length mismatch still counts, because a later pass re-evaluates
+    // it once the canonical length has been adopted.
     const pendingClips = engine
-      ? (this.store?.getClips().filter((clip) => !clip.deleted && !engine.hasLayer(clip.id)).length ?? 0)
+      ? (this.store
+          ?.getClips()
+          .filter(
+            (clip) => !clip.deleted && !this.undecodable.has(clip.blobHash) && !engine.hasLayer(clip.id),
+          ).length ?? 0)
       : 0;
     const next: CollabSnapshot = {
       active: this.store !== null,

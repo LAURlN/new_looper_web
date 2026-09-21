@@ -121,6 +121,13 @@ export class LoopEngine {
   private loopLengthFrames = 0;
   private loopAnchorFrame = 0;
   private nextCycleFrame = 0;
+  /**
+   * Whether the current cycle length came from the shared project state (the canonical
+   * header, or a clip carrying the already-agreed length) rather than from a take on this
+   * device. It changes what a local first take means (an overdub instead of a loop
+   * definition) and when the loop may be released again.
+   */
+  private loopIsShared = false;
   private schedulerTimer: number | null = null;
   private lastTake: { seconds: number; peak: number } | null = null;
   private calibration: CalibrationRecord | null = null;
@@ -261,7 +268,11 @@ export class LoopEngine {
 
       switch (this.state.get().state) {
         case 'IDLE':
-          if (this.layers.length === 0) await this.beginFirstTake();
+          // Only a take that has no shared length to obey *defines* the loop. On a device
+          // that is already cycling the session's shared loop, a take is an overdub: it is
+          // folded into the canonical cycle and published as an ordinary clip, so both
+          // devices stay on one length.
+          if (this.layers.length === 0 && !this.hasSharedLoop()) await this.beginFirstTake();
           else await this.beginOverdubPass();
           break;
         case 'RECORDING':
@@ -298,7 +309,7 @@ export class LoopEngine {
         const [removed] = this.layers.splice(index, 1);
         this.removeHook?.(removed.id);
         if (this.layers.length === 0) {
-          this.stopLoop();
+          this.releaseLoopIfUnowned();
         } else {
           // The current cycle keeps playing; the removed layer simply does not come back.
           this.rescheduleLoop();
@@ -435,6 +446,42 @@ export class LoopEngine {
     return this.loopLengthFrames;
   }
 
+  /** True while the engine is cycling a length adopted from the shared project state. */
+  hasSharedLoop(): boolean {
+    return this.loopIsShared && this.loopLengthFrames > 0;
+  }
+
+  /**
+   * Adopts the session's loop length, expressed in *this* device's context frames.
+   *
+   * This is the read side of the set-once rule: the collaboration layer writes the
+   * canonical length into the project header, and this is what makes the engine obey it.
+   * The conversion from the header's rate to the local context rate happens at the call
+   * site — a loop on this device is always measured in its own frames.
+   *
+   * Returns whether the engine actually started a new loop:
+   * - `localFrames <= 0` (nothing canonical yet): nothing to adopt;
+   * - already on exactly this length: nothing to do — this is idempotent, because every
+   *   header change and every pump calls it;
+   * - already looping something else that this device defined itself: refuse. Clobbering
+   *   it would silently discard audible work, so that conflict is left to the
+   *   collaboration layer to report and to undo to resolve.
+   */
+  adoptSharedLoop(localFrames: number): boolean {
+    if (localFrames <= 0) return false;
+    if (this.loopLengthFrames === localFrames) return false;
+    if (this.loopLengthFrames > 0) return false;
+    // A cycle is anchored on the AudioContext clock, so without a context there is
+    // nothing to anchor it to; the next pump after the context exists adopts it instead.
+    if (!this.ctx) return false;
+    this.adoptLoopLength(localFrames);
+    this.startLoop();
+    // The UI reads the loop length from the snapshot, so this is what makes a joiner show
+    // the session's cycle before it has recorded anything of its own.
+    this.refreshSnapshot();
+    return true;
+  }
+
   hasLayer(id: string): boolean {
     return this.layers.some((layer) => layer.id === id);
   }
@@ -462,13 +509,11 @@ export class LoopEngine {
    */
   addRemoteLayer(clip: { id: string; authorId: string; samples: MonoBuffer }): void {
     if (this.hasLayer(clip.id)) return;
-    const ctx = this.requireCtx();
     if (this.loopLengthFrames <= 0) {
       // No local loop yet: this distant clip defines the cycle (the shared
-      // `cycleFrames` value was already agreed by the collaboration layer).
-      this.loopLengthFrames = clip.samples.length;
-      this.loopAnchorFrame = Math.round(ctx.currentTime * ctx.sampleRate);
-      this.nextCycleFrame = this.loopAnchorFrame;
+      // `cycleFrames` value was already agreed by the collaboration layer). It goes
+      // through the same adoption path as the canonical header, so the two cannot drift.
+      this.adoptLoopLength(clip.samples.length);
     }
     this.layers.push({
       id: clip.id,
@@ -487,7 +532,7 @@ export class LoopEngine {
     const index = this.layers.findIndex((layer) => layer.id === id);
     if (index < 0) return;
     this.layers.splice(index, 1);
-    if (this.layers.length === 0) this.stopLoop();
+    if (this.layers.length === 0) this.releaseLoopIfUnowned();
     else this.rescheduleLoop();
     this.notifyLayersChanged();
   }
@@ -572,6 +617,10 @@ export class LoopEngine {
       shiftFrames: 0,
     });
     this.loopLengthFrames = take.samples.length;
+    // This take *is* the loop, and it is this device's own: nothing in the shared state
+    // defined it, so it may be released again when the last layer goes away (which is
+    // what lets this device adopt the session's length later).
+    this.loopIsShared = false;
     this.startLoop();
     this.setState(this.layers.length >= MAX_LAYERS ? 'FULL' : 'IDLE', { message: null });
     this.noteTake(take.samples);
@@ -585,7 +634,10 @@ export class LoopEngine {
     // so there is nothing to wait for.
     await recorder.arm();
     this.setState('OVERDUBBING', {
-      overdubIndex: this.layers.length,
+      // `Math.max(1, ...)`: a device that has just adopted the shared loop folds its first
+      // take into the canonical cycle with zero layers of its own, and that is a first
+      // overdub, not a 0th one.
+      overdubIndex: Math.max(1, this.layers.length),
       message: null,
     });
     void this.requestWakeLock();
@@ -685,6 +737,25 @@ export class LoopEngine {
   // ------------------------------------------------------- loop playback
 
   /**
+   * The single point where a cycle length that is *not* a local first take enters the
+   * engine: it anchors musical position 0 at "now" and marks the cycle as shared.
+   *
+   * Both adopters use it — a distant clip that arrives before this device has any loop,
+   * and the canonical header read back by the collaboration layer — so the two paths
+   * cannot drift apart. Scheduling is left to the caller, which knows whether layers
+   * already exist.
+   */
+  private adoptLoopLength(frames: number): void {
+    const ctx = this.requireCtx();
+    this.loopLengthFrames = frames;
+    this.loopAnchorFrame = Math.round(ctx.currentTime * ctx.sampleRate);
+    this.nextCycleFrame = this.loopAnchorFrame;
+    // Both callers take a length the shared document is the authority on, which is what
+    // makes a later take here an overdub rather than a new loop definition.
+    this.loopIsShared = true;
+  }
+
+  /**
    * The loop is the first take: its length defines the cycle. Cycles are scheduled ahead
    * of time as individual AudioBufferSourceNodes confined to their own cycle, so nothing
    * drifts and no source can bleed into the next cycle.
@@ -711,6 +782,24 @@ export class LoopEngine {
     this.loopLengthFrames = 0;
     this.loopAnchorFrame = 0;
     this.nextCycleFrame = 0;
+  }
+
+  /**
+   * Called when the last layer disappears. A cycle this device defined itself is released
+   * outright — that is what lets a device that recorded its own first take adopt the shared
+   * length once that work is undone — while a shared cycle is *kept*: the canonical length
+   * outlives any local layer, and a joiner has no layers of its own at all, so dropping it
+   * here would make its next take define a brand new loop.
+   */
+  private releaseLoopIfUnowned(): void {
+    if (this.loopIsShared && this.loopLengthFrames > 0) {
+      // Silence the layers that just went away, but leave the cycle booked so a later
+      // overdub is still folded into (and published at) the session's length.
+      this.stopAllSources();
+      if (this.schedulerTimer === null) this.startLoop();
+      return;
+    }
+    this.stopLoop();
   }
 
   private scheduleHorizon(): void {
