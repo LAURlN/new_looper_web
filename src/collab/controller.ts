@@ -40,9 +40,21 @@ function snapshotKey(snapshot: CollabSnapshot): string {
     peers,
   ].join('|');
 }
-/** How long we keep re-asking for a blob before giving up (a peer may re-seed later). */
-const BLOB_REQUEST_TIMEOUT_MS = 20000;
+/**
+ * Minimum gap between two `blob-want` asks for the same hash.
+ *
+ * This is a throttle, not a deadline: hammering the room is pointless, but an
+ * outstanding request must never turn into a permanent failure.
+ */
+const BLOB_REQUEST_INTERVAL_MS = 5000;
 const PRESENCE_SWEEP_MS = 5000;
+/**
+ * How often the anti-entropy pulse runs: state vectors out, missing audio re-asked.
+ *
+ * The join handshake fires exactly once from `onPeerJoin`, so one lost exchange
+ * would otherwise leave two peers divergent until the next edit.
+ */
+const PULSE_INTERVAL_MS = 2000;
 
 export class CollaborationController {
   readonly snapshot: Observable<CollabSnapshot>;
@@ -50,8 +62,9 @@ export class CollaborationController {
   private readonly identity: PeerIdentity;
   private readonly blobs = new BlobStore();
   private readonly presencePeers = new Map<string, PresencePeer>();
-  private readonly rejected = new Set<string>();
-  /** Hashes we are actively waiting for, mapped to their give-up timer. */
+  /** Blob hashes this device cannot decode. Deterministic, so worth remembering. */
+  private readonly undecodable = new Set<string>();
+  /** Hashes we have asked for, mapped to when we last asked — a throttle, not a deadline. */
   private readonly pending = new Map<string, number>();
 
   private store: ProjectStore | null = null;
@@ -61,6 +74,7 @@ export class CollaborationController {
   private detachDocUpdate: (() => void) | null = null;
   private detachClips: (() => void) | null = null;
   private pruneTimer: number | null = null;
+  private pulseTimer: number | null = null;
   private connection: ConnectionState = 'idle';
   private statusMessage: string | null = null;
   private lastSnapshotKey: string | null = null;
@@ -115,7 +129,7 @@ export class CollaborationController {
     this.roomId = roomId;
     setRoomId(roomId);
     this.presencePeers.clear();
-    this.rejected.clear();
+    this.undecodable.clear();
     this.pending.clear();
     this.connection = 'searching';
     this.statusMessage = null;
@@ -143,6 +157,9 @@ export class CollaborationController {
     transport.start();
 
     this.pruneTimer = window.setInterval(() => this.prunePresence(), PRESENCE_SWEEP_MS);
+    // Anti-entropy, not a heartbeat: cheap enough to run blind, and it is the only
+    // thing that heals a handshake or a transfer that was lost on the first try.
+    this.pulseTimer = window.setInterval(() => this.pulse(), PULSE_INTERVAL_MS);
 
     // If this device already had a solo loop, claim it as the shared loop now.
     this.claimLocalLoopIfNeeded();
@@ -154,6 +171,10 @@ export class CollaborationController {
       window.clearInterval(this.pruneTimer);
       this.pruneTimer = null;
     }
+    if (this.pulseTimer !== null) {
+      window.clearInterval(this.pulseTimer);
+      this.pulseTimer = null;
+    }
     this.detachDocUpdate?.();
     this.detachDocUpdate = null;
     this.detachClips?.();
@@ -162,7 +183,7 @@ export class CollaborationController {
     this.transport?.stop();
     this.transport = null;
 
-    for (const timer of this.pending.values()) window.clearTimeout(timer);
+    // Request times only; nothing is left behind by clearing them.
     this.pending.clear();
 
     this.store?.destroy();
@@ -170,7 +191,7 @@ export class CollaborationController {
     this.roomId = null;
     clearRoomId();
     this.presencePeers.clear();
-    this.rejected.clear();
+    this.undecodable.clear();
     this.connection = 'idle';
     this.statusMessage = null;
     this.emit();
@@ -292,45 +313,69 @@ export class CollaborationController {
     this.emit();
   }
 
+  /**
+   * Applies the shared document. The store/network half always runs; only the
+   * audio half needs an AudioContext.
+   *
+   * That split is the whole point: an AudioContext is created with the microphone,
+   * on a gesture — so a device that joins a session and never records would
+   * otherwise never fetch, decode or play anything.
+   */
   private async pumpOnce(): Promise<void> {
     const store = this.store;
     const engine = this.engine;
-    if (!store || !engine || !engine.hasAudioContext()) return;
+    if (!store || !engine) return;
 
-    // Share anything recorded before the session existed.
+    // Share anything recorded before the session existed. Needs a sample rate,
+    // which only exists with a context; it returns early on its own and must not
+    // stop the rest of the pass.
     await this.publishExistingLayers();
 
+    const audioReady = engine.hasAudioContext();
     const clips = store.getClips();
 
     // Removals first, so a tombstone is honoured even if the blob never arrives.
-    for (const clip of clips) {
-      if (clip.deleted && engine.hasLayer(clip.id)) engine.removeLayer(clip.id);
+    // Actually dropping the audio touches the scheduler, so this half is the one
+    // that needs a context; the document is already correct either way.
+    if (audioReady) {
+      for (const clip of clips) {
+        if (clip.deleted && engine.hasLayer(clip.id)) engine.removeLayer(clip.id);
+      }
     }
 
     for (const clip of clips) {
-      if (clip.deleted || engine.hasLayer(clip.id) || this.rejected.has(clip.id)) continue;
+      if (clip.deleted || engine.hasLayer(clip.id)) continue;
+      // A payload this device already failed to decode will fail again, identically:
+      // the bytes are content-addressed, so the memory is keyed by hash (two clips
+      // can share one). A length mismatch is not like that — the canonical loop can
+      // still change — so a mismatch only ever skips this pass.
+      if (this.undecodable.has(clip.blobHash)) continue;
 
-      if (!this.isCompatible(engine, clip)) {
-        this.rejected.add(clip.id);
-        this.statusMessage = 'A clip was recorded against a different loop length, so it was not added.';
+      // Compatibility asks about *this* device's loop, so it only means anything
+      // once a context exists.
+      if (audioReady && !this.isCompatible(engine, clip)) {
+        this.statusMessage = 'A clip has a different loop length — retrying.';
         continue;
       }
 
+      // Bytes are fetched even without a context: a device that joins but never
+      // records must be able to hold the audio, or it can never hear the loop.
       const stored = await this.blobs.get(clip.blobHash);
       if (!stored) {
         this.requestBlob(clip.blobHash);
         continue;
       }
+      if (!audioReady) continue; // hold the bytes; the audio half runs once a context exists
 
       try {
         const samples = await decodeClip(stored.bytes, engine.audioContext());
         if (samples.length === 0) {
-          this.rejected.add(clip.id);
+          this.undecodable.add(clip.blobHash);
           continue;
         }
         engine.addRemoteLayer({ id: clip.id, authorId: clip.authorId, samples });
       } catch {
-        this.rejected.add(clip.id);
+        this.undecodable.add(clip.blobHash);
         this.statusMessage = 'A clip could not be decoded on this device and was skipped.';
       }
     }
@@ -347,14 +392,57 @@ export class CollaborationController {
     return Math.abs(clipSeconds - localSeconds) <= Math.max(0.002, localSeconds * 0.01);
   }
 
+  /**
+   * Asks the room for a hash, at most once every `BLOB_REQUEST_INTERVAL_MS`.
+   *
+   * This used to be one-shot with a 20 s give-up timer, which made a single lost
+   * transfer permanent for the whole session. Asking again is nearly free (the
+   * answer is a few dozen bytes or the audio itself), so we simply keep asking.
+   */
   private requestBlob(hash: string): void {
-    if (this.pending.has(hash) || !this.transport) return;
-    const timer = window.setTimeout(() => {
-      this.pending.delete(hash);
-      this.emit();
-    }, BLOB_REQUEST_TIMEOUT_MS);
-    this.pending.set(hash, timer);
-    void this.transport.sendBlobWant(hash);
+    const transport = this.transport;
+    if (!transport) return;
+    const askedAt = this.pending.get(hash);
+    const now = Date.now();
+    if (askedAt !== undefined && now - askedAt < BLOB_REQUEST_INTERVAL_MS) return;
+    this.pending.set(hash, now);
+    void transport.sendBlobWant(hash);
+  }
+
+  /**
+   * Anti-entropy pulse: push our state vector at every peer and re-ask for any
+   * referenced audio we still do not hold.
+   *
+   * The peer's own pulse covers the other direction, so both sides converge even
+   * when a handshake or a transfer was lost. It emits nothing: the pulse changes
+   * no state by itself, and `emit()` already de-duplicates identical snapshots.
+   */
+  private pulse(): void {
+    const store = this.store;
+    const transport = this.transport;
+    if (!store || !transport) return;
+    const peers = transport.peerIds;
+    if (peers.length === 0) return; // nobody to converge with
+    const vector = store.encodeStateVector();
+    for (const peerId of peers) void transport.sendStateVector(peerId, vector);
+    void this.auditMissingBlobs();
+  }
+
+  /**
+   * Re-asks for the bytes behind every live clip we do not have.
+   *
+   * This is the other half of removing the give-up timer: the pump only retries
+   * when the document changes or a gesture arrives, so a transfer that failed
+   * quietly would otherwise sit unfetched until something else happened.
+   */
+  private async auditMissingBlobs(): Promise<void> {
+    const store = this.store;
+    if (!store || !this.transport) return;
+    for (const clip of store.getClips()) {
+      if (clip.deleted) continue;
+      if (await this.blobs.has(clip.blobHash)) continue;
+      this.requestBlob(clip.blobHash);
+    }
   }
 
   // ----------------------------------------------------------- transport in
@@ -453,11 +541,8 @@ export class CollaborationController {
         cycleFrames: metadata && typeof metadata.cycleFrames === 'number' ? metadata.cycleFrames : 0,
         createdAt: Date.now(),
       });
-      const timer = this.pending.get(hash);
-      if (timer !== undefined) {
-        window.clearTimeout(timer);
-        this.pending.delete(hash);
-      }
+      // The bytes are here, so this hash is no longer outstanding.
+      this.pending.delete(hash);
       void this.pump();
     } catch {
       /* hashing unavailable — nothing we can safely store */

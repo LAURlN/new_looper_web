@@ -157,13 +157,14 @@ export class LoopEngine {
   // ---------------------------------------------------------------- lifecycle
 
   /**
-   * Creates the AudioContext (+ mic graph) on the first user gesture. Creates the context
-   * only once, keeps the mic stream alive for the whole session, and is safe to call from
-   * every pointerdown.
+   * Creates (and resumes) the AudioContext and its graph — but never the microphone.
+   *
+   * Joining a session must be able to decode and play shared audio without ever
+   * prompting for microphone permission, so the context half lives here on its own:
+   * `ensureReady()` is this plus the mic input. Safe to call repeatedly, and safe
+   * outside a gesture (the context simply starts suspended and is resumed later).
    */
-  async ensureReady(): Promise<ReadyProblem> {
-    if (this.fatal) return this.fatal;
-
+  async ensureAudioContext(): Promise<AudioContext> {
     if (!this.ctx) {
       // Must happen synchronously inside the gesture handler; no await before resume().
       const ctx = new AudioContext({ latencyHint: 'interactive' });
@@ -193,6 +194,19 @@ export class LoopEngine {
         /* still suspended; the banner keeps prompting the user */
       }
     }
+
+    return ctx;
+  }
+
+  /**
+   * Creates the AudioContext (+ mic graph) on the first user gesture. Creates the context
+   * only once, keeps the mic stream alive for the whole session, and is safe to call from
+   * every pointerdown.
+   */
+  async ensureReady(): Promise<ReadyProblem> {
+    if (this.fatal) return this.fatal;
+
+    const ctx = await this.ensureAudioContext();
 
     if (!this.recorder) {
       try {

@@ -77,11 +77,14 @@ collab.snapshot.subscribe((snapshot) => {
 async function startSession(roomId: string): Promise<void> {
   sheet.setStatus('Starting session…');
   try {
-    await collab.start(roomId);
     // Deliberately *not* `engine.ensureReady()`: joining a room must not ask for
-    // microphone access. Recording opens the AudioContext as usual, and any
-    // pre-existing solo loop is picked up by the pump once a context exists
-    // (`pumpPublic` is retried on the next gesture, see the listeners below).
+    // microphone access. But the context itself is required — without one the pump
+    // can only move metadata, so a device that joins and never records would hold
+    // the audio and still hear nothing. Starting a session is a gesture (or an
+    // invite link), so opening the context here is allowed and never prompts.
+    await engine.ensureAudioContext();
+    await collab.start(roomId);
+    // The context now exists, so this pass also decodes and plays what has arrived.
     await collab.pumpPublic();
     sheet.setStatus(null);
   } catch (error) {
