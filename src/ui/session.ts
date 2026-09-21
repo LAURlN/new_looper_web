@@ -17,6 +17,8 @@ export interface SessionTabOptions {
   onStart(): void;
   onLeave(): void;
   onCopyLink(): void;
+  /** Copies a paste-ready report of the document and wire state (see `diagnosticsReport()`). */
+  onCopyDiagnostics(): void;
 }
 
 const CONNECTION_LABEL: Record<CollabSnapshot['connection'], string> = {
@@ -165,6 +167,16 @@ export function createSessionTab(options: SessionTabOptions): SheetTab {
       identityRow.append(peerDot(identity.color), name);
       identityField.append(identityLabel, identityRow);
       panel.append(identityField);
+
+      // Not decoration: every wire path swallows its own errors, so this report is the only
+      // way to tell from a phone whether a take actually reached the shared document.
+      const diagnostics = document.createElement('button');
+      diagnostics.type = 'button';
+      diagnostics.className = 'btn btn-block';
+      diagnostics.style.marginTop = '12px';
+      diagnostics.textContent = 'Copy diagnostics';
+      diagnostics.addEventListener('click', () => options.onCopyDiagnostics());
+      panel.append(diagnostics);
 
       if (snapshot.status) {
         const message = document.createElement('p');

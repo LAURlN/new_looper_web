@@ -59,6 +59,11 @@ function snapshotKey(snapshot: CollabSnapshot): string {
     peers,
   ].join('|');
 }
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 /**
  * Minimum gap between two `blob-want` asks for the same hash.
  *
@@ -106,6 +111,21 @@ export class CollaborationController {
   private pumping = false;
   private repump = false;
   private destroyed = false;
+  /** Last clip count written to the console, so a document change is announced once. */
+  private lastLoggedClipCount = -1;
+
+  /**
+   * Counters for the diagnostics report. Nothing here changes behaviour: the point is to be
+   * able to tell "the peer never got it" apart from "we never sent it" from two phones.
+   */
+  private readonly diag = {
+    published: 0,
+    publishErrors: 0,
+    applied: 0,
+    applyErrors: 0,
+    encodeErrors: 0,
+    lastError: null as string | null,
+  };
 
   constructor() {
     this.identity = loadIdentity();
@@ -134,6 +154,69 @@ export class CollaborationController {
 
   shareUrl(): string | null {
     return this.roomId ? buildShareUrl(this.roomId) : null;
+  }
+
+  /**
+   * A paste-ready description of what this device believes and what it has actually sent.
+   *
+   * "Nothing syncs" is otherwise indistinguishable from "nothing was sent": every send in the
+   * transport sits behind a `catch {}` and every handler call is fire-and-forget, so a failure
+   * leaves no trace. `doc:` is the ground truth (what the shared document holds *here*), and
+   * the wire lines name both directions, so two of these reports pin the failure to a link.
+   */
+  diagnosticsReport(): string {
+    const engine = this.engine;
+    const store = this.store;
+    const wire = this.transport ? this.transport.wireStats : null;
+    const header = store ? store.getHeader() : null;
+    const clips = store ? store.getClips() : [];
+    const deleted = clips.filter((clip) => clip.deleted).length;
+
+    let canonical = 'none';
+    if (header && header.sampleRate && header.cycleFrames) {
+      canonical = `${header.cycleFrames} frames @ ${header.sampleRate} Hz (${(
+        header.cycleFrames / header.sampleRate
+      ).toFixed(2)} s)`;
+    }
+
+    const loopFrames = engine ? engine.getLoopLengthFrames() : 0;
+    const sampleRate = engine ? engine.getSampleRate() : null;
+    let loop = 'none';
+    if (loopFrames > 0 && sampleRate) {
+      loop = `${loopFrames} frames @ ${sampleRate} Hz (${(loopFrames / sampleRate).toFixed(2)} s)`;
+    }
+
+    let context = 'none';
+    if (engine && engine.hasAudioContext()) context = engine.audioContext().state;
+
+    return [
+      'loop-recorder session diagnostics',
+      `when: ${new Date().toISOString()}`,
+      `agent: ${navigator.userAgent}`,
+      `secure context: ${window.isSecureContext ? 'yes' : 'NO'}`,
+      `room: ${this.roomId ?? '-'}   me: ${this.identity.id} (${this.identity.name})`,
+      `connection: ${this.connection}   known peers: ${
+        this.transport ? this.transport.peerIds.length : 0
+      }   presence peers: ${this.presencePeers.size}`,
+      `doc: clips ${clips.length} (deleted ${deleted})   canonical loop: ${canonical}`,
+      `engine: loop ${loop}   shared loop: ${
+        engine && engine.hasSharedLoop() ? 'yes' : 'no'
+      }   state: ${engine ? engine.state.get().state : 'n/a'}   context: ${context}`,
+      `published: ${this.diag.published} clip(s), ${this.diag.publishErrors} error(s)`,
+      `applied: ${this.diag.applied} update(s), ${this.diag.applyErrors} apply error(s), ${
+        this.diag.encodeErrors
+      } encode error(s)`,
+      `y-upd: out ${wire ? wire.updOut : '-'} (${wire ? wire.updOutBytes : '-'} b, ${
+        wire ? wire.updOutErrors : '-'
+      } err)   in ${wire ? wire.updIn : '-'}`,
+      `y-sv: out ${wire ? wire.svOut : '-'} (${wire ? wire.svOutErrors : '-'} err)   in ${
+        wire ? wire.svIn : '-'
+      }`,
+      `blobs: out ${wire ? wire.blobOut : '-'}   in ${wire ? wire.blobIn : '-'}   pending wants: ${
+        this.pending.size
+      }   undecodable: ${this.undecodable.size}`,
+      `last error: ${this.diag.lastError ?? (wire ? wire.lastError : null) ?? 'none'}`,
+    ].join('\n');
   }
 
   /** Called once at startup. In solo use nothing is published until a room is joined. */
@@ -250,6 +333,7 @@ export class CollaborationController {
     if (this.destroyed || this.store !== store) return;
 
     this.detachClips = store.clips.subscribe(() => {
+      this.logClipCount();
       void this.pump();
       this.emit();
     });
@@ -381,6 +465,13 @@ export class CollaborationController {
         this.emit();
         return;
       }
+      this.diag.published++;
+      // One line per take: this is the proof that this device's audio reached the document.
+      console.info(
+        `[collab] published clip ${clip.id.slice(0, 8)} (${clip.cycleFrames} frames, ${
+          bytes.byteLength
+        } b, first=${clip.isFirst})`,
+      );
       // Tell the room we can serve these bytes (the room is its own CDN).
       await this.transport?.sendBlobHave({
         hash,
@@ -390,6 +481,9 @@ export class CollaborationController {
         codec: DEFAULT_CODEC,
       });
     } catch (error) {
+      this.diag.publishErrors++;
+      this.diag.lastError = `publish: ${errorText(error)}`;
+      console.warn(`[collab] ${this.diag.lastError}`);
       this.statusMessage = error instanceof Error ? error.message : 'Could not share the take';
       this.emit();
     }
@@ -663,7 +757,17 @@ export class CollaborationController {
     if (!store || !transport) return;
     const peers = transport.peerIds;
     if (peers.length === 0) return; // nobody to converge with
-    const vector = store.encodeStateVector();
+    let vector: Uint8Array;
+    try {
+      vector = store.encodeStateVector();
+    } catch (error) {
+      // A state vector that cannot be built means no handshake can ever be sent, so this is
+      // worth surfacing rather than letting the pulse fail silently every two seconds.
+      this.diag.encodeErrors++;
+      this.diag.lastError = `encode state vector: ${errorText(error)}`;
+      console.warn(`[collab] ${this.diag.lastError}`);
+      return;
+    }
     for (const peerId of peers) void transport.sendStateVector(peerId, vector);
     void this.auditMissingBlobs();
   }
@@ -707,12 +811,34 @@ export class CollaborationController {
       onPeersChanged: () => this.emit(),
       onUpdate: (update, fromPeer) => {
         // The origin is what stops an update echoing straight back to its sender.
-        this.store?.applyUpdate(update, `peer:${fromPeer}`);
+        try {
+          this.store?.applyUpdate(update, `peer:${fromPeer}`);
+          this.diag.applied++;
+        } catch (error) {
+          // A throw in here used to escape into Trystero's dispatcher and leave no trace
+          // anywhere the user could see, which is exactly how "nothing syncs" stayed
+          // unexplained. Record it and keep the session alive.
+          this.diag.applyErrors++;
+          this.diag.lastError = `apply update: ${errorText(error)}`;
+          console.warn(`[collab] ${this.diag.lastError}`);
+          this.emit();
+        }
       },
       onStateVector: (peerId, vector) => {
         const store = this.store;
         const transport = this.transport;
-        if (store && transport) void transport.sendUpdate(store.encodeDiff(vector), peerId);
+        if (!store || !transport) return;
+        try {
+          // `encodeDiff()` decodes the peer's state vector, so a truncated or corrupted
+          // vector throws right here — the one place a broken handshake would otherwise
+          // look like "the peer simply never sends anything".
+          void transport.sendUpdate(store.encodeDiff(vector), peerId);
+        } catch (error) {
+          this.diag.encodeErrors++;
+          this.diag.lastError = `encode diff: ${errorText(error)}`;
+          console.warn(`[collab] ${this.diag.lastError}`);
+          this.emit();
+        }
       },
       onPresence: (peerId, payload) => {
         this.presencePeers.set(peerId, {
@@ -827,6 +953,14 @@ export class CollaborationController {
     // de-duplicates, so re-running it while somebody is legitimately recording changes
     // nothing.
     if (changed || this.snapshot.get().remoteRecording !== null) this.emit();
+  }
+
+  /** One console line per change in the document's clip count — the "did it cross?" signal. */
+  private logClipCount(): void {
+    const count = this.store ? this.store.getClips().length : 0;
+    if (count === this.lastLoggedClipCount) return;
+    this.lastLoggedClipCount = count;
+    console.info(`[collab] document now holds ${count} clip(s)`);
   }
 
   private emit(): void {

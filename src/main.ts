@@ -31,6 +31,9 @@ const sessionTab = createSessionTab({
   onCopyLink: () => {
     void copyInviteLink();
   },
+  onCopyDiagnostics: () => {
+    void copyDiagnostics();
+  },
 });
 
 const sheet = createSettingsSheet(document.body, {
@@ -110,6 +113,24 @@ async function copyInviteLink(): Promise<void> {
   } catch {
     // Clipboard can be blocked; showing the link is still useful.
     sheet.setStatus(url);
+  }
+}
+
+/**
+ * Copies the session report and always prints it to the console.
+ *
+ * Every send and receive in the collaboration layer is fire-and-forget, so a broken link in
+ * the chain looks identical to nothing having happened. This report is what turns "it doesn't
+ * sync" into a named line: nothing was sent, nothing arrived, or it arrived and was refused.
+ */
+async function copyDiagnostics(): Promise<void> {
+  const report = collab.diagnosticsReport();
+  console.info(report);
+  try {
+    await navigator.clipboard.writeText(report);
+    sheet.setStatus('Diagnostics copied (also printed in the console)');
+  } catch {
+    sheet.setStatus('Diagnostics printed in the console (clipboard blocked)');
   }
 }
 

@@ -45,6 +45,35 @@ export interface TransportHandlers {
   onStatus(connection: ConnectionState, message: string | null): void;
 }
 
+/**
+ * Counters for the wire, for the diagnostics report.
+ *
+ * Every send in this class sits behind a `catch {}`, which makes a permanent failure look
+ * exactly like success: nothing anywhere could tell "the peer never got it" apart from "we
+ * never sent it". These counters, plus `lastError`, exist to make that difference visible.
+ */
+export interface WireStats {
+  /** `y-upd` sends that completed / that threw, and the payload bytes handed to Trystero. */
+  updOut: number;
+  updOutErrors: number;
+  updOutBytes: number;
+  /** `y-sv` sends that completed / that threw. */
+  svOut: number;
+  svOutErrors: number;
+  /** Updates and state vectors that arrived from a peer. */
+  updIn: number;
+  svIn: number;
+  /** Blob messages out/in (counts only; the byte totals are not interesting here). */
+  blobOut: number;
+  blobIn: number;
+  /** The most recent send failure, or null. */
+  lastError: string | null;
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   // copy() gives the view its own exactly-sized buffer; `.buffer` is then safe to send.
   return bytes.slice().buffer;
@@ -69,6 +98,19 @@ export class P2PTransport {
 
   private readonly identityPayload: JsonRecord;
 
+  private readonly stats: WireStats = {
+    updOut: 0,
+    updOutErrors: 0,
+    updOutBytes: 0,
+    svOut: 0,
+    svOutErrors: 0,
+    updIn: 0,
+    svIn: 0,
+    blobOut: 0,
+    blobIn: 0,
+    lastError: null,
+  };
+
   constructor(
     private readonly roomId: string,
     identity: { id: string; name: string; color: string },
@@ -83,6 +125,18 @@ export class P2PTransport {
 
   get active(): boolean {
     return this.room !== null;
+  }
+
+  /** A copy, so a reader can never mutate the counters. */
+  get wireStats(): WireStats {
+    return { ...this.stats };
+  }
+
+  /** Records a send failure and makes it visible: this used to be a silent `catch {}`. */
+  private noteSendError(scope: string, error: unknown): void {
+    const message = `${scope}: ${errorText(error)}`;
+    this.stats.lastError = message;
+    console.warn(`[collab] ${message}`);
   }
 
   start(): void {
@@ -120,11 +174,21 @@ export class P2PTransport {
 
     this.updateAction = room.makeAction<ArrayBuffer>('y-upd');
     this.updateAction.onMessage = (data, { peerId }) => {
+      this.stats.updIn++;
+      // Only the first few arrivals are logged; the counters carry the rest. Seeing this
+      // line at all is what proves the document is crossing the wire.
+      if (this.stats.updIn <= 3) {
+        console.info(`[collab] y-upd received ${data.byteLength} b from ${peerId}`);
+      }
       this.handlers.onUpdate(new Uint8Array(data), peerId);
     };
 
     this.stateVectorAction = room.makeAction<ArrayBuffer>('y-sv');
     this.stateVectorAction.onMessage = (data, { peerId }) => {
+      this.stats.svIn++;
+      if (this.stats.svIn <= 2) {
+        console.info(`[collab] y-sv received ${data.byteLength} b from ${peerId}`);
+      }
       this.handlers.onStateVector(peerId, new Uint8Array(data));
     };
 
@@ -145,6 +209,7 @@ export class P2PTransport {
 
     this.blobDataAction = room.makeAction<ArrayBuffer>('blob-data');
     this.blobDataAction.onMessage = (data, { peerId, metadata }) => {
+      this.stats.blobIn++;
       this.handlers.onBlobData(peerId, data, isJsonRecord(metadata) ? metadata : null);
     };
 
@@ -201,22 +266,45 @@ export class P2PTransport {
 
   async sendUpdate(update: Uint8Array, exceptPeer?: string): Promise<void> {
     const action = this.updateAction;
-    if (!action) return;
+    if (!action) {
+      this.noteSendError('y-upd send', new Error('action missing — transport not started'));
+      return;
+    }
+    // An empty target list is not "everybody": it means the only peer we know about is the
+    // one that sent this update, so the send is skipped on purpose (that is how the flood
+    // terminates). The counters still record the attempt, so "out 0 b" means "no peers".
     const targets = exceptPeer ? this.peers.filter((id) => id !== exceptPeer) : null;
+    const bytes = update.byteLength;
     try {
       await action.send(toArrayBuffer(update), targets ? { target: targets } : undefined);
-    } catch {
-      /* the peer went away mid-send — nothing to recover */
+      this.stats.updOut++;
+      this.stats.updOutBytes += bytes;
+      if (this.stats.updOut <= 3) {
+        console.info(
+          `[collab] y-upd sent ${bytes} b to ${targets ? targets.join(',') || '(no peer)' : 'all peers'}`,
+        );
+      }
+    } catch (error) {
+      this.stats.updOutErrors++;
+      this.noteSendError('y-upd send', error);
     }
   }
 
   async sendStateVector(target: string, vector: Uint8Array): Promise<void> {
     const action = this.stateVectorAction;
-    if (!action) return;
+    if (!action) {
+      this.noteSendError('y-sv send', new Error('action missing — transport not started'));
+      return;
+    }
     try {
       await action.send(toArrayBuffer(vector), { target });
-    } catch {
-      /* ignore */
+      this.stats.svOut++;
+      if (this.stats.svOut <= 2) {
+        console.info(`[collab] y-sv sent ${vector.byteLength} b to ${target}`);
+      }
+    } catch (error) {
+      this.stats.svOutErrors++;
+      this.noteSendError('y-sv send', error);
     }
   }
 
@@ -235,16 +323,18 @@ export class P2PTransport {
   async sendBlobHave(metadata: JsonRecord, target?: string): Promise<void> {
     try {
       await this.blobHaveAction?.send(metadata, target ? { target } : undefined);
-    } catch {
-      /* ignore */
+      this.stats.blobOut++;
+    } catch (error) {
+      this.noteSendError('blob-have send', error);
     }
   }
 
   async sendBlobWant(hash: string, target?: string): Promise<void> {
     try {
       await this.blobWantAction?.send({ hash }, target ? { target } : undefined);
-    } catch {
-      /* ignore */
+      this.stats.blobOut++;
+    } catch (error) {
+      this.noteSendError('blob-want send', error);
     }
   }
 
@@ -252,8 +342,9 @@ export class P2PTransport {
     try {
       // Trystero chunks and throttles large binary payloads for us.
       await this.blobDataAction?.send(bytes, { target, metadata });
-    } catch {
-      /* peer vanished; the requester will simply ask someone else */
+      this.stats.blobOut++;
+    } catch (error) {
+      this.noteSendError('blob-data send', error);
     }
   }
 
