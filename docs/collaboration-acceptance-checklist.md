@@ -118,18 +118,24 @@ basic flow, so every item below is either `covered by design` or `not yet verifi
 
 - **Situation.** A clip id that has already been tombstoned is offered again.
 - **Why it matters.** A delete that can be undone by a late arrival is not a delete.
-- **How the current implementation covers it.** The pump skips any record with
-  `deleted` ([`pumpOnce()`](src/collab/controller.ts:551)) and removes the layer if it
-  exists, and the engine refuses to add a layer it already holds. In practice nothing
-  re-publishes a tombstoned id: [`publishExistingLayers()`](src/collab/controller.ts:388)
-  skips ids already known to the store, and `publishClip()` only runs on a genuine commit.
-- **Partial coverage — stated plainly.** The guard is "the tombstone is honoured on read,
-  and no code path re-appends a tombstoned id", not an explicit "is this id tombstoned?"
-  check inside `appendClip()`. A future code path that re-appended the same id after a
-  tombstone would therefore resurrect it.
+- **How the current implementation covers it.** A clip id may be appended **once**:
+  [`appendClip()`](src/collab/projectStore.ts:244) refuses an id that is already present in
+  the clip list and reports the refusal instead of writing. A tombstone keeps its array entry
+  with `deleted: true`, so "already present" includes "present and deleted" — the store itself
+  now makes a deleted clip impossible to re-append, instead of relying on no caller happening
+  to try. A refusal is not treated as a share either:
+  [`publishClip()`](src/collab/controller.ts:346) does not announce the blob and says so on the
+  status line. On the read side the pump skips any record with `deleted`
+  ([`pumpOnce()`](src/collab/controller.ts:534)), removes the layer if it exists, and the
+  engine refuses to add a layer it already holds.
+- **Stated plainly.** The guard sits on the append path — the only way a clip enters the
+  document in this codebase — and answers "is this id already here?" against this device's
+  replica. It is not a merge-level rule: Yjs still merges two peers' documents, and a peer that
+  never saw the tombstone cannot be stopped by it.
 - **Manual check.** Delete a clip, then reload the deleting device and reconnect. The clip
   must not come back.
-- **Status:** `covered by design` (partly — see the note above).
+- **Status:** `covered by design` — the refusal is now a property of the store rather than a
+  convention its callers follow, but it has not been exercised on real devices.
 
 ### 8. Bounds and mismatch handling
 
@@ -267,7 +273,7 @@ basic flow, so every item below is either `covered by design` or `not yet verifi
 | 4 | Concurrent creation is not deletion | `covered by design` |
 | 5 | No peer is dropped for being behind | `covered by design` |
 | 6 | Per-author audio partition | `covered by design` |
-| 7 | Late add on a deleted clip is rejected | `covered by design` (partly) |
+| 7 | Late add on a deleted clip is rejected | `covered by design` |
 | 8 | Bounds and mismatch handling | `covered by design` (partly) |
 | 9 | Loop adoption | `covered by design` |
 | 10 | Rate conversion | `not yet verified` |

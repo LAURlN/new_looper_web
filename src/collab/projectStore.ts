@@ -241,7 +241,18 @@ export class ProjectStore {
     return Math.abs(existingSeconds - incomingSeconds) <= tolerance ? 'agreed' : 'conflict';
   }
 
-  appendClip(meta: ClipMeta): void {
+  appendClip(meta: ClipMeta): boolean {
+    // An id may be appended **once**, and that single rule is the whole guard: a tombstone
+    // keeps its array entry with `deleted: true`, so "this id is already in the list" already
+    // covers "this id was deleted". A deleted clip therefore cannot be re-appended even if a
+    // future code path tries to — resurrection is impossible by construction instead of by
+    // every caller remembering to check first — and a duplicate publish of a live id is a
+    // no-op for the same reason. Same lookup shape as `tombstoneClip()`: both ask the one
+    // question "is this id in the clip list?", and neither should be able to answer it
+    // differently.
+    for (const item of this.clipsArray) {
+      if (item instanceof Y.Map && item.get('id') === meta.id) return false;
+    }
     this.doc.transact(() => {
       const map = new Y.Map<unknown>();
       map.set('id', meta.id);
@@ -257,6 +268,9 @@ export class ProjectStore {
       map.set('deleted', false);
       this.clipsArray.push([map]);
     });
+    // `true` is "the clip is in the project now"; `false` is "it already was (or was deleted),
+    // and nothing was written" — the caller has to report that rather than announce a share.
+    return true;
   }
 
   /** Deletes are tombstones, so they commute with concurrent edits and offline time. */

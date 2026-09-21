@@ -358,7 +358,7 @@ export class CollaborationController {
         cycleFrames: clip.cycleFrames,
         createdAt: Date.now(),
       });
-      store.appendClip({
+      const appended = store.appendClip({
         id: clip.id,
         authorId: clip.authorId,
         authorName: this.identity.name,
@@ -370,6 +370,17 @@ export class CollaborationController {
         blobBytes: bytes.byteLength,
         slot: clip.slot,
       });
+      // A refusal means this id is already in the shared document: either a duplicate publish,
+      // or a clip this device (or a peer) tombstoned — the store keeps a deleted clip's entry,
+      // which is what makes the guard cover deletion at all. Either way the take is not part of
+      // the project, so it must not be announced: a `blob-have` for a clip no record references
+      // would only make peers ask for audio they can never use. Report it the same way the
+      // catch below does, so the user sees that the take was kept locally but not shared.
+      if (!appended) {
+        this.statusMessage = 'That take is already in the session, so it was not shared again.';
+        this.emit();
+        return;
+      }
       // Tell the room we can serve these bytes (the room is its own CDN).
       await this.transport?.sendBlobHave({
         hash,
